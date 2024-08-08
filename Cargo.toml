@@ -1,0 +1,22 @@
+[package]
+name = "axum_gcra"
+authors = ["novacrazy <novacrazy@gmail.com>"]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+include = ["src/**/*", "LICENSE-*", "README.md"]
+repository = "https://github.com/Lantern-chat/axum_gcra"
+keywords = ["axum", "rate-limiting", "middleware", "gcra"]
+
+[dependencies]
+tower = "0.4"
+scc = "2"
+axum = { version = "0.7", default-features = false, features = ["matched-path"] }
+ahash = "0.8.11"
+http = "1.1.0"
+futures-util = "0.3.30"
+pin-project-lite = "0.2.14"
+
+[dev-dependencies]
+axum = { version = "0.7", default-features = true }
+tokio = { version = "1", features = ["full", "macros"] }
