@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
+    borrow::{Borrow, Cow},
     collections::HashMap,
     convert::Infallible,
     future::{Future, Ready},
@@ -16,15 +17,37 @@ use axum::{
     error_handling::HandleErrorLayer,
     extract::{MatchedPath as AxumMatchedPath, Request},
 };
-use http::Extensions;
+use http::{Extensions, Method};
 use tower::{Layer, Service};
 
 pub mod gcra;
 pub use gcra::RateLimitError;
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Route<'a> {
+    pub path: Cow<'a, str>,
+    pub method: Cow<'a, Method>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct RouteWithKey<T> {
+    pub path: MatchedPath,
+    pub method: Method,
+    pub key: T,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct StaticRoute(Route<'static>);
+
+impl<'a> Borrow<Route<'a>> for StaticRoute {
+    fn borrow(&self) -> &Route<'a> {
+        &self.0
+    }
+}
+
 /// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router)
 /// to a [`gcra::Quota`].
-pub type Quotas = HashMap<String, gcra::Quota, ahash::RandomState>;
+type Quotas = HashMap<StaticRoute, gcra::Quota, ahash::RandomState>;
 
 #[derive(Debug, Clone)]
 enum MatchedPath {
@@ -93,8 +116,6 @@ where
     }
 }
 
-type Key<T> = (MatchedPath, T);
-
 pub struct RateLimitService<S, K: GetKey<B>, B> {
     inner: S,
     layer: RateLimitLayer<K, B>,
@@ -110,15 +131,15 @@ pub struct RateLimitLayerBuilder<K: GetKey<B>, B> {
 
 pub struct RateLimitLayer<K: GetKey<B>, B> {
     builder: Arc<RateLimitLayerBuilder<K, B>>,
-    limiter: Arc<gcra::RateLimiter<Key<K::T>, ahash::RandomState>>,
+    limiter: Arc<gcra::RateLimiter<RouteWithKey<K::T>, ahash::RandomState>>,
 }
 
 trait SetExtension<T: Hash + Eq>: Send + Sync + 'static {
     fn set_extension(
         &self,
         req: &mut Extensions,
-        key: &Key<T>,
-        limiter: Arc<gcra::RateLimiter<Key<T>, ahash::RandomState>>,
+        key: &RouteWithKey<T>,
+        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
     );
 }
 
@@ -131,8 +152,8 @@ where
     fn set_extension(
         &self,
         req: &mut Extensions,
-        key: &Key<T>,
-        limiter: Arc<gcra::RateLimiter<Key<T>, ahash::RandomState>>,
+        key: &RouteWithKey<T>,
+        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
     ) {
         req.insert(RateLimiter {
             key: key.clone(),
@@ -165,24 +186,31 @@ where
 impl<S, K: GetKey<B>, B> RateLimitService<S, K, B> {
     fn req_sync_peek_key<F>(
         &self,
-        mut key: Key<K::T>,
+        mut key: RouteWithKey<K::T>,
         now: std::time::Instant,
         peek: F,
     ) -> Result<(), RateLimitError>
     where
-        F: FnOnce(&Key<K::T>),
+        F: FnOnce(&RouteWithKey<K::T>),
     {
         let builder = &self.layer.builder;
-        let quota = match builder.quotas.get(&*key.0).copied() {
+
+        let quota_key = Route {
+            path: Cow::Borrowed(&*key.path),
+            method: Cow::Borrowed(&key.method),
+        };
+
+        let quota = match builder.quotas.get(&quota_key).copied() {
             Some(quota) => quota,
             None => {
                 if builder.root_fallback {
-                    key.0 = MatchedPath::Root;
+                    key.path = MatchedPath::Root;
                 }
 
                 builder.default_quota
             }
         };
+
         self.layer.limiter.req_sync_peek_key(key, quota, now, peek)
     }
 }
@@ -201,15 +229,31 @@ impl<B> RateLimitLayer<DefaultGetKey, B> {
 }
 
 impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
-    /// Set quota table for the rate limiter.
-    pub fn set_quotas(mut self, quotas: Quotas) -> Self {
-        self.quotas = quotas;
-        self
+    /// Insert an entry into the quota table for the rate limiter.
+    pub fn add_quota(&mut self, path: impl Into<Cow<'static, str>>, method: Method, quota: gcra::Quota) {
+        self.add_quotas(Some((path.into(), method, quota)));
     }
 
-    /// Insert entries into the quota table for the rate limiter.
-    pub fn add_quotas(mut self, quotas: impl IntoIterator<Item = (String, gcra::Quota)>) -> Self {
-        self.quotas.extend(quotas);
+    /// Insert many entries into the quota table for the rate limiter.
+    pub fn add_quotas(&mut self, quotas: impl IntoIterator<Item = (Cow<'static, str>, Method, gcra::Quota)>) {
+        self.quotas.extend(quotas.into_iter().map(|(path, method, quota)| {
+            (
+                StaticRoute(Route {
+                    path,
+                    method: Cow::Owned(method),
+                }),
+                quota,
+            )
+        }));
+    }
+
+    /// Set the quota table for the rate limiter, replacing any existing quotas.
+    pub fn set_quotas(
+        mut self,
+        quotas: impl IntoIterator<Item = (Cow<'static, str>, Method, gcra::Quota)>,
+    ) -> Self {
+        self.quotas.clear();
+        self.add_quotas(quotas);
         self
     }
 
@@ -323,7 +367,11 @@ where
 
         let builder = &self.layer.builder;
 
-        let key = (path, builder.get_key.get_key(&req));
+        let key = RouteWithKey {
+            path,
+            method: req.method().clone(),
+            key: builder.get_key.get_key(&req),
+        };
 
         let res = self.req_sync_peek_key(key, now, |key| {
             if let Some(ref set_ext) = builder.set_ext {
@@ -396,8 +444,8 @@ where
 /// such as to apply a penalty or reset the rate limit.
 #[derive(Clone)]
 pub struct RateLimiter<T: Hash + Eq> {
-    key: Key<T>,
-    limiter: Arc<gcra::RateLimiter<Key<T>, ahash::RandomState>>,
+    key: RouteWithKey<T>,
+    limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
 }
 
 impl<T: Hash + Eq> RateLimiter<T> {
