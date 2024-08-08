@@ -175,11 +175,13 @@ impl<S, K: GetKey<B>, B> RateLimitService<S, K, B> {
         let builder = &self.layer.builder;
         let quota = match builder.quotas.get(&*key.0).copied() {
             Some(quota) => quota,
-            None if builder.root_fallback => {
-                key.0 = MatchedPath::Root;
+            None => {
+                if builder.root_fallback {
+                    key.0 = MatchedPath::Root;
+                }
+
                 builder.default_quota
             }
-            None => builder.default_quota,
         };
         self.layer.limiter.req_sync_peek_key(key, quota, now, peek)
     }
