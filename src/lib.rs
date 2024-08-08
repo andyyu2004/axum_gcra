@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -19,7 +21,9 @@ use tower::{Layer, Service};
 pub mod gcra;
 pub use gcra::RateLimitError;
 
-type Quotas = HashMap<String, gcra::Quota, ahash::RandomState>;
+/// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router)
+/// to a [`gcra::Quota`].
+pub type Quotas = HashMap<String, gcra::Quota, ahash::RandomState>;
 
 #[derive(Debug, Clone)]
 enum MatchedPath {
@@ -57,12 +61,14 @@ impl Hash for MatchedPath {
     }
 }
 
+/// Defines a trait for extracting a key from a request.
 pub trait GetKey<B>: Clone {
     type T: Hash + Eq + Send + Sync + 'static;
 
     fn get_key(&self, req: &Request<B>) -> Self::T;
 }
 
+/// Default implementation of [`GetKey`] that does nothing.
 #[derive(Clone, Copy)]
 pub struct DefaultGetKey;
 
@@ -166,6 +172,7 @@ impl<S, K: GetKey<B>, B> RateLimitService<S, K, B> {
 }
 
 impl<B> RateLimitLayer<DefaultGetKey, B> {
+    /// Build a new rate limiter layer starting with the default configuration.
     pub fn builder() -> RateLimitLayerBuilder<DefaultGetKey, B> {
         RateLimitLayerBuilder {
             quotas: Default::default(),
@@ -177,21 +184,25 @@ impl<B> RateLimitLayer<DefaultGetKey, B> {
 }
 
 impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
+    /// Set quota table for the rate limiter.
     pub fn set_quotas(mut self, quotas: Quotas) -> Self {
         self.quotas = quotas;
         self
     }
 
+    /// Insert entries into the quota table for the rate limiter.
     pub fn add_quotas(mut self, quotas: impl IntoIterator<Item = (String, gcra::Quota)>) -> Self {
         self.quotas.extend(quotas);
         self
     }
 
+    /// Fallback quota for rate limiting if no specific quota is found for the path.
     pub fn set_default_quota(mut self, default_quota: gcra::Quota) -> Self {
         self.default_quota = default_quota;
         self
     }
 
+    /// Provide a function to extract a key from the request.
     pub fn with_key<K>(self, get_key: K) -> RateLimitLayerBuilder<K, B>
     where
         K: GetKey<B>,
@@ -206,6 +217,8 @@ impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
 }
 
 impl<K: GetKey<B>, B> RateLimitLayerBuilder<K, B> {
+    /// Set whether to insert the [`RateLimiter`] into the request's extensions
+    /// to allow for manual rate limiting control.
     pub fn with_extension(mut self, extend: bool) -> Self
     where
         K::T: Clone + Send + Sync + 'static,
@@ -224,6 +237,7 @@ impl Default for RateLimitLayerBuilder<DefaultGetKey, axum::body::Body> {
     }
 }
 
+/// Error wrapper for rate limiting errors or inner service errors.
 pub enum Error<Inner> {
     Inner(Inner),
     RateLimit(RateLimitError),

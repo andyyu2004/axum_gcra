@@ -30,6 +30,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         self.limits.retain_async(move |_, v| *AtomicU64::get_mut(&mut v.0) >= before).await;
     }
 
+    /// Perform a request, returning an error if the request is too soon.
     pub async fn req(&self, key: K, quota: Quota, now: Instant) -> Result<(), RateLimitError> {
         let now = self.relative(now);
 
@@ -46,6 +47,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         res
     }
 
+    /// Synchonous version of [`RateLimiter::req`].
     pub fn req_sync(&self, key: K, quota: Quota, now: Instant) -> Result<(), RateLimitError> {
         let now = self.relative(now);
 
@@ -116,6 +118,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         self.limits.read_async(key, |_, grca| grca.0.fetch_add(penalty, Ordering::Relaxed)).await.is_some()
     }
 
+    /// Synchronous version of [`RateLimiter::penalize`].
     pub fn penalize_sync<Q>(&self, key: &Q, penalty: u64) -> bool
     where
         K: Borrow<Q>,
@@ -124,6 +127,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         self.limits.read(key, |_, grca| grca.0.fetch_add(penalty, Ordering::Relaxed)).is_some()
     }
 
+    /// Resets the rate limit for the given key, returning `true` if the key was found.
     pub async fn reset<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -132,6 +136,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         self.limits.remove_async(key).await.is_some()
     }
 
+    /// Synchronous version of [`RateLimiter::reset`].
     pub fn reset_sync<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,

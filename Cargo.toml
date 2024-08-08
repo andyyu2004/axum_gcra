@@ -1,12 +1,14 @@
 [package]
 name = "axum_gcra"
+description = "GCRA-based Rate Limiter for Axum with per-route/per-key rate limiting"
 authors = ["novacrazy <novacrazy@gmail.com>"]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 include = ["src/**/*", "LICENSE-*", "README.md"]
 repository = "https://github.com/Lantern-chat/axum_gcra"
 keywords = ["axum", "rate-limiting", "middleware", "gcra"]
+categories = ["web-programming"]
 
 [dependencies]
 tower = "0.4"
