@@ -9,6 +9,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{ready, Context, Poll},
+    time::Duration,
 };
 
 use axum::{
@@ -103,6 +104,7 @@ pub struct RateLimitLayerBuilder<K: GetKey<B>, B> {
     quotas: Quotas,
     default_quota: gcra::Quota,
     set_ext: Option<Box<dyn SetExtension<K::T>>>,
+    root_fallback: bool,
     get_key: K,
 }
 
@@ -161,12 +163,24 @@ where
 }
 
 impl<S, K: GetKey<B>, B> RateLimitService<S, K, B> {
-    fn req_sync_peek_key<F>(&self, key: Key<K::T>, now: std::time::Instant, peek: F) -> Result<(), RateLimitError>
+    fn req_sync_peek_key<F>(
+        &self,
+        mut key: Key<K::T>,
+        now: std::time::Instant,
+        peek: F,
+    ) -> Result<(), RateLimitError>
     where
         F: FnOnce(&Key<K::T>),
     {
         let builder = &self.layer.builder;
-        let quota = builder.quotas.get(&*key.0).copied().unwrap_or(builder.default_quota);
+        let quota = match builder.quotas.get(&*key.0).copied() {
+            Some(quota) => quota,
+            None if builder.root_fallback => {
+                key.0 = MatchedPath::Root;
+                builder.default_quota
+            }
+            None => builder.default_quota,
+        };
         self.layer.limiter.req_sync_peek_key(key, quota, now, peek)
     }
 }
@@ -178,6 +192,7 @@ impl<B> RateLimitLayer<DefaultGetKey, B> {
             quotas: Default::default(),
             default_quota: Default::default(),
             set_ext: None,
+            root_fallback: false,
             get_key: DefaultGetKey,
         }
     }
@@ -202,6 +217,14 @@ impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
         self
     }
 
+    /// Set whether to fallback to the root path (`/`) if no specific quota is found for the path.
+    ///
+    /// This allows for a single root quota to be used for all fallback paths.
+    pub fn set_root_fallback(mut self, root_fallback: bool) -> Self {
+        self.root_fallback = root_fallback;
+        self
+    }
+
     /// Provide a function to extract a key from the request.
     pub fn with_key<K>(self, get_key: K) -> RateLimitLayerBuilder<K, B>
     where
@@ -211,6 +234,7 @@ impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
             quotas: self.quotas,
             default_quota: self.default_quota,
             set_ext: None,
+            root_fallback: self.root_fallback,
             get_key,
         }
     }
@@ -376,12 +400,12 @@ pub struct RateLimiter<T: Hash + Eq> {
 
 impl<T: Hash + Eq> RateLimiter<T> {
     /// See [`gcra::RateLimiter::penalize`] for more information.
-    pub async fn penalize(&self, penalty: u64) -> bool {
+    pub async fn penalize(&self, penalty: Duration) -> bool {
         self.limiter.penalize(&self.key, penalty).await
     }
 
     /// See [`gcra::RateLimiter::penalize_sync`] for more information.
-    pub fn penalize_sync(&self, penalty: u64) -> bool {
+    pub fn penalize_sync(&self, penalty: Duration) -> bool {
         self.limiter.penalize_sync(&self.key, penalty)
     }
 

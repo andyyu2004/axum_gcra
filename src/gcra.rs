@@ -105,26 +105,38 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         res
     }
 
-    /// Penalizes the given key by the given amount of time (in nanoseconds),
+    /// Penalizes the given key by the given amount of time,
     /// returning `true` if the key was found.
     ///
     /// NOTE: This is a relative penalty, so if used on an old entry it may be inneffective.
     /// Best to use after [`RateLimiter::req`] has been called receently.
-    pub async fn penalize<Q>(&self, key: &Q, penalty: u64) -> bool
+    ///
+    /// NOTE: Furthermore, it uses a 64-bit integer to store the GCRA value,
+    /// so it may overflow if used with too large a value. Keep it modest.
+    pub async fn penalize<Q>(&self, key: &Q, penalty: Duration) -> bool
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.limits.read_async(key, |_, grca| grca.0.fetch_add(penalty, Ordering::Relaxed)).await.is_some()
+        self.limits
+            .read_async(key, |_, grca| {
+                grca.0.fetch_add(penalty.as_nanos() as u64, Ordering::Relaxed)
+            })
+            .await
+            .is_some()
     }
 
     /// Synchronous version of [`RateLimiter::penalize`].
-    pub fn penalize_sync<Q>(&self, key: &Q, penalty: u64) -> bool
+    pub fn penalize_sync<Q>(&self, key: &Q, penalty: Duration) -> bool
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.limits.read(key, |_, grca| grca.0.fetch_add(penalty, Ordering::Relaxed)).is_some()
+        self.limits
+            .read(key, |_, grca| {
+                grca.0.fetch_add(penalty.as_nanos() as u64, Ordering::Relaxed)
+            })
+            .is_some()
     }
 
     /// Resets the rate limit for the given key, returning `true` if the key was found.
