@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
 
 use std::{
     borrow::Cow,
@@ -22,6 +23,52 @@ use tower::{Layer, Service};
 
 pub mod gcra;
 pub use gcra::RateLimitError;
+
+/// Interval for garbage collection of the rate limiter, which can be either
+/// a number of requests or a time duration.
+///
+/// The default is 8192 requests.
+///
+/// Time durations require the `timed_gc` cargo feature to be enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GCInterval {
+    /// Run garbage collection after a number of requests.
+    Requests(u64),
+
+    /// Run garbage collection on a timed interval using a background task.
+    #[cfg(feature = "timed_gc")]
+    Time(Duration),
+}
+
+impl Default for GCInterval {
+    fn default() -> Self {
+        GCInterval::Requests(8192)
+    }
+}
+
+impl GCInterval {
+    fn to_requests(self) -> u64 {
+        match self {
+            GCInterval::Requests(n) => n,
+
+            #[cfg(feature = "timed_gc")]
+            GCInterval::Time(_) => u64::MAX,
+        }
+    }
+}
+
+impl From<u64> for GCInterval {
+    fn from(n: u64) -> Self {
+        GCInterval::Requests(n)
+    }
+}
+
+#[cfg(feature = "timed_gc")]
+impl From<Duration> for GCInterval {
+    fn from(d: Duration) -> Self {
+        GCInterval::Time(d)
+    }
+}
 
 /// A route for rate limiting, consisting of a path and method.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -145,13 +192,29 @@ pub struct RateLimitService<S, K: GetKey<B>, B> {
     layer: RateLimitLayer<K, B>,
 }
 
+#[cfg(feature = "timed_gc")]
+#[derive(Default, Clone)]
+struct BuilderDropNotify {
+    notify: Arc<tokio::sync::Notify>,
+}
+
 pub struct RateLimitLayerBuilder<K: GetKey<B>, B> {
     quotas: Quotas,
     default_quota: gcra::Quota,
     set_ext: Option<Box<dyn SetExtension<K::T>>>,
     root_fallback: bool,
     get_key: K,
-    gc_interval: u64,
+    gc_interval: GCInterval,
+
+    #[cfg(feature = "timed_gc")]
+    shutdown: BuilderDropNotify,
+}
+
+#[cfg(feature = "timed_gc")]
+impl<K: GetKey<B>, B> Drop for RateLimitLayerBuilder<K, B> {
+    fn drop(&mut self) {
+        self.shutdown.notify.notify_waiters();
+    }
 }
 
 pub struct RateLimitLayer<K: GetKey<B>, B> {
@@ -249,7 +312,10 @@ impl<B> RateLimitLayer<DefaultGetKey, B> {
             set_ext: None,
             root_fallback: false,
             get_key: DefaultGetKey,
-            gc_interval: 8192,
+            gc_interval: GCInterval::default(),
+
+            #[cfg(feature = "timed_gc")]
+            shutdown: BuilderDropNotify::default(),
         }
     }
 }
@@ -308,30 +374,33 @@ impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
         self
     }
 
-    /// Set the garbage collection interval for the rate limiter, which is measured in
-    /// the number of unique requests processed rather than in time.
+    /// Set the interval for which garbage collection for the rate limiter will occur.
+    /// Garbage collection in this case is defined as removing old requests from the rate limiter.
     ///
-    /// GC is triggered when the number of requests processed exceeds this interval, during
-    /// the request.
+    /// The default is 8192 requests.
     ///
-    /// The default is 8192.
-    pub fn set_gc_interval(mut self, gc_interval: u64) -> Self {
-        self.gc_interval = gc_interval;
+    /// If the `timed_gc` feature is enabled, this can also be a time [`Duration`],
+    /// and a background task will be spawned to clean the rate limiter at the given interval.
+    pub fn set_gc_interval(mut self, gc_interval: impl Into<GCInterval>) -> Self {
+        self.gc_interval = gc_interval.into();
         self
     }
 
     /// Provide a function to extract a key from the request.
-    pub fn with_key<K>(self, get_key: K) -> RateLimitLayerBuilder<K, B>
+    pub fn with_key<K>(mut self, get_key: K) -> RateLimitLayerBuilder<K, B>
     where
         K: GetKey<B>,
     {
         RateLimitLayerBuilder {
-            quotas: self.quotas,
+            quotas: std::mem::take(&mut self.quotas),
             default_quota: self.default_quota,
             set_ext: None,
             root_fallback: self.root_fallback,
             get_key,
             gc_interval: self.gc_interval,
+
+            #[cfg(feature = "timed_gc")]
+            shutdown: std::mem::take(&mut self.shutdown),
         }
     }
 }
@@ -358,8 +427,12 @@ impl Default for RateLimitLayerBuilder<DefaultGetKey, axum::body::Body> {
 }
 
 /// Error wrapper for rate limiting errors or inner service errors.
+#[derive(Debug)]
 pub enum Error<Inner> {
+    /// Inner service error.
     Inner(Inner),
+
+    /// Rate limiting error.
     RateLimit(RateLimitError),
 }
 
@@ -467,9 +540,37 @@ where
     where
         F: Fn(RateLimitError) -> R + Clone,
     {
+        let limiter = Arc::new(gcra::RateLimiter::new(
+            self.gc_interval.to_requests(),
+            Default::default(),
+        ));
+
+        #[cfg(feature = "timed_gc")]
+        if let GCInterval::Time(d) = self.gc_interval {
+            let limiter = limiter.clone();
+            let signal = self.shutdown.clone();
+
+            _ = tokio::task::spawn(async move {
+                let mut interval = tokio::time::interval(d);
+                loop {
+                    tokio::select! { biased;
+                        _ = signal.notify.notified() => break,
+                        _ = interval.tick() => {},
+                    }
+
+                    limiter.clean(Instant::now()).await;
+
+                    // also close task if no more references to the limiter
+                    if Arc::strong_count(&limiter) == 1 {
+                        break;
+                    }
+                }
+            });
+        }
+
         Stack::new(
             RateLimitLayer {
-                limiter: Arc::new(gcra::RateLimiter::new(self.gc_interval, Default::default())),
+                limiter,
                 builder: Arc::new(self),
             },
             HandleErrorLayer::new(move |e| match e {

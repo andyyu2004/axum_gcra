@@ -32,6 +32,10 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         }
     }
 
+    fn should_gc(&self) -> bool {
+        self.gc_interval != u64::MAX && 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval
+    }
+
     #[inline]
     fn relative(&self, ts: Instant) -> u64 {
         ts.saturating_duration_since(self.start).as_nanos() as u64
@@ -56,7 +60,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         let now = self.relative(now);
 
         let Some(res) = self.limits.read_async(&key, |_, gcra| gcra.req(quota, now)).await else {
-            if 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval {
+            if self.should_gc() {
                 self.limits.retain_async(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now).await;
             }
 
@@ -77,7 +81,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         let now = self.relative(now);
 
         let Some(res) = self.limits.read(&key, |_, gcra| gcra.req(quota, now)) else {
-            if 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval {
+            if self.should_gc() {
                 self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
             }
 
@@ -118,7 +122,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
             let peek = unsafe { peek.unwrap_unchecked() };
 
             // since we hit the slow path, perform garbage collection
-            if 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval {
+            if self.should_gc() {
                 self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
             }
 
