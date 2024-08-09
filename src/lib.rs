@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Cow,
     collections::HashMap,
     convert::Infallible,
     future::{Future, Ready},
@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{ready, Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -23,31 +23,55 @@ use tower::{Layer, Service};
 pub mod gcra;
 pub use gcra::RateLimitError;
 
+/// A route for rate limiting, consisting of a path and method.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Route<'a> {
     pub path: Cow<'a, str>,
     pub method: Cow<'a, Method>,
 }
 
+macro_rules! decl_route_methods {
+    ($($fn:ident => $method:ident),*) => {
+        impl<'a> Route<'a> {
+            /// Create a new route with the given path and method.
+            pub fn new(path: impl Into<Cow<'a, str>>, method: Method) -> Self {
+                Self {
+                    path: path.into(),
+                    method: Cow::Owned(method),
+                }
+            }
+
+            $(
+                #[doc = concat!("Create a new route with the [`", stringify!($method), "`](Method::", stringify!($method), ") method.")]
+                pub fn $fn(path: impl Into<Cow<'a, str>>) -> Route<'a> {
+                    Route::new(path, Method::$method)
+                }
+            )*
+        }
+    };
+}
+
+decl_route_methods! {
+    get => GET,
+    post => POST,
+    put => PUT,
+    delete => DELETE,
+    patch => PATCH,
+    options => OPTIONS,
+    head => HEAD,
+    trace => TRACE,
+    connect => CONNECT
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct RouteWithKey<T> {
-    pub path: MatchedPath,
-    pub method: Method,
-    pub key: T,
+    path: MatchedPath,
+    method: Method,
+    key: T,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct StaticRoute(Route<'static>);
-
-impl<'a> Borrow<Route<'a>> for StaticRoute {
-    fn borrow(&self) -> &Route<'a> {
-        &self.0
-    }
-}
-
-/// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router)
-/// to a [`gcra::Quota`].
-type Quotas = HashMap<StaticRoute, gcra::Quota, ahash::RandomState>;
+/// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router) to a [`gcra::Quota`].
+type Quotas = HashMap<Route<'static>, gcra::Quota, ahash::RandomState>;
 
 #[derive(Debug, Clone)]
 enum MatchedPath {
@@ -127,6 +151,7 @@ pub struct RateLimitLayerBuilder<K: GetKey<B>, B> {
     set_ext: Option<Box<dyn SetExtension<K::T>>>,
     root_fallback: bool,
     get_key: K,
+    gc_interval: u64,
 }
 
 pub struct RateLimitLayer<K: GetKey<B>, B> {
@@ -224,33 +249,45 @@ impl<B> RateLimitLayer<DefaultGetKey, B> {
             set_ext: None,
             root_fallback: false,
             get_key: DefaultGetKey,
+            gc_interval: 8192,
         }
     }
 }
 
 impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
-    /// Insert an entry into the quota table for the rate limiter.
+    /// Insert a route entry into the quota table for the rate limiter.
     pub fn add_quota(&mut self, path: impl Into<Cow<'static, str>>, method: Method, quota: gcra::Quota) {
         self.add_quotas(Some((path.into(), method, quota)));
     }
 
-    /// Insert many entries into the quota table for the rate limiter.
-    pub fn add_quotas(&mut self, quotas: impl IntoIterator<Item = (Cow<'static, str>, Method, gcra::Quota)>) {
-        self.quotas.extend(quotas.into_iter().map(|(path, method, quota)| {
-            (
-                StaticRoute(Route {
-                    path,
-                    method: Cow::Owned(method),
-                }),
-                quota,
-            )
-        }));
+    /// Insert a route entry into the quota table for the rate limiter.
+    pub fn with_quota(mut self, path: impl Into<Cow<'static, str>>, method: Method, quota: gcra::Quota) -> Self {
+        self.add_quota(path, method, quota);
+        self
     }
 
-    /// Set the quota table for the rate limiter, replacing any existing quotas.
+    /// Insert many route entries into the quota table for the rate limiter.
+    pub fn add_quotas(
+        &mut self,
+        quotas: impl IntoIterator<Item = (impl Into<Cow<'static, str>>, Method, gcra::Quota)>,
+    ) {
+        self.quotas
+            .extend(quotas.into_iter().map(|(path, method, quota)| (Route::new(path, method), quota)));
+    }
+
+    /// Insert many route entries into the quota table for the rate limiter.
+    pub fn with_quotas(
+        mut self,
+        quotas: impl IntoIterator<Item = (impl Into<Cow<'static, str>>, Method, gcra::Quota)>,
+    ) -> Self {
+        self.add_quotas(quotas);
+        self
+    }
+
+    /// Set the quota table for the rate limiter, replacing any existing routes and quotas.
     pub fn set_quotas(
         mut self,
-        quotas: impl IntoIterator<Item = (Cow<'static, str>, Method, gcra::Quota)>,
+        quotas: impl IntoIterator<Item = (impl Into<Cow<'static, str>>, Method, gcra::Quota)>,
     ) -> Self {
         self.quotas.clear();
         self.add_quotas(quotas);
@@ -271,6 +308,18 @@ impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
         self
     }
 
+    /// Set the garbage collection interval for the rate limiter, which is measured in
+    /// the number of unique requests processed rather than in time.
+    ///
+    /// GC is triggered when the number of requests processed exceeds this interval, during
+    /// the request.
+    ///
+    /// The default is 8192.
+    pub fn set_gc_interval(mut self, gc_interval: u64) -> Self {
+        self.gc_interval = gc_interval;
+        self
+    }
+
     /// Provide a function to extract a key from the request.
     pub fn with_key<K>(self, get_key: K) -> RateLimitLayerBuilder<K, B>
     where
@@ -282,6 +331,7 @@ impl<B> RateLimitLayerBuilder<DefaultGetKey, B> {
             set_ext: None,
             root_fallback: self.root_fallback,
             get_key,
+            gc_interval: self.gc_interval,
         }
     }
 }
@@ -419,8 +469,8 @@ where
     {
         Stack::new(
             RateLimitLayer {
+                limiter: Arc::new(gcra::RateLimiter::new(self.gc_interval, Default::default())),
                 builder: Arc::new(self),
-                limiter: Arc::default(),
             },
             HandleErrorLayer::new(move |e| match e {
                 Error::RateLimit(e) => cb(e),
@@ -467,5 +517,15 @@ impl<T: Hash + Eq> RateLimiter<T> {
     /// See [`gcra::RateLimiter::reset_sync`] for more information.
     pub fn reset_sync(&self) -> bool {
         self.limiter.reset_sync(&self.key)
+    }
+
+    /// See [`gcra::RateLimiter::clean`] for more information.
+    pub async fn clean(&self, before: Instant) {
+        self.limiter.clean(before).await;
+    }
+
+    /// See [`gcra::RateLimiter::clean_sync`] for more information.
+    pub fn clean_sync(&self, before: Instant) {
+        self.limiter.clean_sync(before);
     }
 }

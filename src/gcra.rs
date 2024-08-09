@@ -15,10 +15,23 @@ use scc::hash_map::{Entry, HashMap};
 /// This rate limiter is designed to be used in a concurrent environment, and is thread-safe.
 pub struct RateLimiter<K: Eq + Hash, H: BuildHasher = std::collections::hash_map::RandomState> {
     start: Instant,
+    gc_interval: u64,
+    last_gc: AtomicU64,
     limits: HashMap<K, Gcra, H>,
 }
 
 impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
+    /// Constructs a new rate limiter with the given GCRA hasher and garbage collection interval, which is in number of requests
+    /// (i.e. how many requests to process before cleaning up old entries), not time.
+    pub fn new(gc_interval: u64, hasher: H) -> Self {
+        RateLimiter {
+            start: Instant::now(),
+            gc_interval,
+            last_gc: AtomicU64::new(1),
+            limits: HashMap::with_hasher(hasher),
+        }
+    }
+
     #[inline]
     fn relative(&self, ts: Instant) -> u64 {
         ts.saturating_duration_since(self.start).as_nanos() as u64
@@ -28,6 +41,14 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
     pub async fn clean(&self, before: Instant) {
         let before = self.relative(before);
         self.limits.retain_async(move |_, v| *AtomicU64::get_mut(&mut v.0) >= before).await;
+        self.last_gc.store(1, Ordering::Relaxed); // manual reset
+    }
+
+    /// Synchronous version of [`RateLimiter::clean`].
+    pub fn clean_sync(&self, before: Instant) {
+        let before = self.relative(before);
+        self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= before);
+        self.last_gc.store(1, Ordering::Relaxed); // manual reset
     }
 
     /// Perform a request, returning an error if the request is too soon.
@@ -35,6 +56,10 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         let now = self.relative(now);
 
         let Some(res) = self.limits.read_async(&key, |_, gcra| gcra.req(quota, now)).await else {
+            if 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval {
+                self.limits.retain_async(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now).await;
+            }
+
             return match self.limits.entry_async(key).await {
                 Entry::Occupied(gcra) => gcra.get().req(quota, now),
                 Entry::Vacant(gcra) => {
@@ -52,6 +77,10 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         let now = self.relative(now);
 
         let Some(res) = self.limits.read(&key, |_, gcra| gcra.req(quota, now)) else {
+            if 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval {
+                self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
+            }
+
             return match self.limits.entry(key) {
                 Entry::Occupied(gcra) => gcra.get().req(quota, now),
                 Entry::Vacant(gcra) => {
@@ -87,6 +116,11 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         }) else {
             // otherwise we're free to unwrap it and use it here normally
             let peek = unsafe { peek.unwrap_unchecked() };
+
+            // since we hit the slow path, perform garbage collection
+            if 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval {
+                self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
+            }
 
             return match self.limits.entry(key) {
                 Entry::Occupied(gcra) => {
@@ -163,10 +197,8 @@ where
     H: Default,
 {
     fn default() -> Self {
-        RateLimiter {
-            start: Instant::now(),
-            limits: HashMap::default(),
-        }
+        // default to 8192 unique requests before garbage collection
+        RateLimiter::new(8192, H::default())
     }
 }
 

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use axum::{extract::Request, routing::get, Router};
 use axum_gcra::{gcra::Quota, RateLimitLayer, RateLimiter};
+use http::Method;
 
 #[tokio::main]
 async fn main() {
@@ -20,6 +21,7 @@ async fn main() {
         .route_layer(
             RateLimitLayer::builder()
                 .set_default_quota(Quota::simple(Duration::from_secs(5)))
+                .with_quota("/build", Method::GET, Quota::simple(Duration::from_secs(2)))
                 .with_extension(true)
                 .set_root_fallback(true)
                 .default_handle_error(),
