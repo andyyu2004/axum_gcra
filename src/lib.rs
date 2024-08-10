@@ -29,6 +29,9 @@ pub mod real_ip;
 ///
 /// Keys should be uniquely identifiable to avoid rate limiting other users,
 /// e.g. using a user ID or IP address.
+///
+/// Keys must also implement [`FromRequestParts`] to extract the key from the request
+/// within the rate limiter layer/service.
 pub trait Key: Hash + Eq + Send + Sync + 'static {}
 
 impl<T> Key for T where T: Hash + Eq + Send + Sync + 'static {}
@@ -45,9 +48,16 @@ pub use gcra::RateLimitError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GCInterval {
     /// Run garbage collection after a number of requests.
+    ///
+    /// This may temporarily block a request if the rate limiter is being cleaned,
+    /// as that single request needs to wait on all parts of the table to be cleaned.
+    ///
+    /// Setting this to `u64::MAX` will disable garbage collection entirely.
     Requests(u64),
 
     /// Run garbage collection on a timed interval using a background task.
+    ///
+    /// This does not block the request, since it runs externally to the request.
     #[cfg(feature = "tokio")]
     Time(Duration),
 }
@@ -252,7 +262,7 @@ where
         key: &RouteWithKey<T>,
         limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
     ) {
-        req.insert(RateLimiter {
+        req.insert(extensions::RateLimiter {
             key: key.clone(),
             limiter,
         });
@@ -278,36 +288,6 @@ impl<I: Clone, K: Key> Clone for RateLimitService<I, K> {
 }
 
 impl<K: Key> RateLimitLayer<K> {
-    async fn req_peek_key<F>(
-        &self,
-        mut key: RouteWithKey<K>,
-        now: std::time::Instant,
-        peek: F,
-    ) -> Result<(), RateLimitError>
-    where
-        F: FnOnce(&RouteWithKey<K>),
-    {
-        let quota_key = Route {
-            path: Cow::Borrowed(&*key.path),
-            method: Cow::Borrowed(&key.method),
-        };
-
-        let quota = match self.builder.quotas.get(&quota_key).copied() {
-            Some(quota) => quota,
-            None => {
-                if self.builder.global_fallback {
-                    key.path = MatchedPath::Fallback;
-                }
-
-                self.builder.default_quota
-            }
-        };
-
-        self.limiter.req_peek_key(key, quota, now, peek).await
-    }
-}
-
-impl<K: Key> RateLimitLayer<K> {
     /// Begin building a new rate limiter layer starting with the default configuration.
     pub fn builder() -> RateLimitLayerBuilder<K> {
         RateLimitLayerBuilder::new()
@@ -329,27 +309,27 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     }
 
     /// Insert a route entry into the quota table for the rate limiter.
-    pub fn add_quota(&mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) {
-        self.add_quotas(Some((route.into(), quota)));
+    pub fn add_route(&mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) {
+        self.add_routes(Some((route.into(), quota)));
     }
 
     /// Insert a route entry into the quota table for the rate limiter.
-    pub fn with_quota(mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) -> Self {
-        self.add_quota(route.into(), quota);
+    pub fn with_route(mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) -> Self {
+        self.add_route(route.into(), quota);
         self
     }
 
     /// Insert many route entries into the quota table for the rate limiter.
-    pub fn add_quotas(&mut self, quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>) {
+    pub fn add_routes(&mut self, quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>) {
         self.quotas.extend(quotas.into_iter().map(|(route, quota)| (route.into(), quota)));
     }
 
     /// Insert many route entries into the quota table for the rate limiter.
-    pub fn with_quotas(
+    pub fn with_routes(
         mut self,
         quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>,
     ) -> Self {
-        self.add_quotas(quotas);
+        self.add_routes(quotas);
         self
     }
 
@@ -366,33 +346,39 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     }
 
     /// Set the interval for which garbage collection for the rate limiter will occur.
-    /// Garbage collection in this case is defined as removing old requests from the rate limiter.
+    /// Garbage collection in this case is defined as removing old expired requests
+    /// from the rate limiter table to avoid it growing indefinitely.
     ///
     /// The default is 8192 requests.
     ///
     /// If the `tokio` feature is enabled, this can also be a time [`Duration`],
-    /// and a background task will be spawned to clean the rate limiter at the given interval.
+    /// and a background task will be spawned to clean the rate limiter at the
+    /// given time interval. Cleanup is asynchronous and will not block the request
+    /// in this case.
     pub fn with_gc_interval(mut self, gc_interval: impl Into<GCInterval>) -> Self {
         self.gc_interval = gc_interval.into();
         self
     }
 
-    /// Set whether to insert the [`RateLimiter`] into the request's extensions
-    /// to allow for manual rate limiting control.
+    /// Set whether to insert the [`RateLimiter`](extensions::RateLimiter) extension into the request
+    /// to allow for manual rate limiting control downstream.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use std::time::Duration;
     /// use axum::{extract::Extension, routing::get, Router};
-    /// use axum_gcra::{RateLimitLayer, RateLimiter};
+    /// use axum_gcra::{RateLimitLayer, extensions::RateLimiter};
+    ///
+    /// // Note this must be identical to the key used in the rate limiter layer
+    /// type Key = ();
     ///
     /// let app = Router::<()>::new()
     ///     // access the rate limiter for this request
-    ///     .route("/", get(|rl: Extension<RateLimiter>| async move {
+    ///     .route("/", get(|rl: Extension<RateLimiter<Key>>| async move {
     ///         rl.penalize(Duration::from_secs(50)).await;
     ///     }))
-    ///     .route_layer(RateLimitLayer::<()>::builder().with_extension(true).default_handle_error());
+    ///     .route_layer(RateLimitLayer::<Key>::builder().with_extension(true).default_handle_error());
     pub fn with_extension(mut self, extend: bool) -> Self
     where
         K: Clone,
@@ -452,8 +438,8 @@ pin_project_lite::pin_project! {
         RateLimiting {
             #[pin] f: BoxFuture<'static, Result<Parts, Error<I::Error, K::Rejection>>>,
 
-            inner: I, // storing I separately helps avoid an I: Sync bound
-            body: Option<B>, // similar story, helps avoid B: Send + 'static bound
+            inner: I, // storing `I` separately helps avoid an `I: Sync` bound
+            body: Option<B>, // similar story, helps avoid `B: Send + 'static` bound
         },
 
         Inner { #[pin] f: I::Future },
@@ -484,6 +470,36 @@ where
                 },
             }
         }
+    }
+}
+
+impl<K: Key> RateLimitLayer<K> {
+    async fn req_peek_key<F>(
+        &self,
+        mut key: RouteWithKey<K>,
+        now: std::time::Instant,
+        peek: F,
+    ) -> Result<(), RateLimitError>
+    where
+        F: FnOnce(&RouteWithKey<K>),
+    {
+        let quota_key = Route {
+            path: Cow::Borrowed(&*key.path),
+            method: Cow::Borrowed(&key.method),
+        };
+
+        let quota = match self.builder.quotas.get(&quota_key).copied() {
+            Some(quota) => quota,
+            None => {
+                if self.builder.global_fallback {
+                    key.path = MatchedPath::Fallback;
+                }
+
+                self.builder.default_quota
+            }
+        };
+
+        self.limiter.req_peek_key(key, quota, now, peek).await
     }
 }
 
@@ -572,8 +588,8 @@ where
     /// Build the [`RateLimitLayer`].
     ///
     /// This will create a new rate limiter and, if the `tokio` feature is
-    /// enabled and the interval is a time [`Duration`], spawn a background task for
-    /// garbage collection.
+    /// enabled and the [GC interval](RateLimitLayerBuilder::with_gc_interval)
+    /// is a time [`Duration`], spawn a background task for garbage collection.
     ///
     /// By itself, `RateLimitLayer` cannot be directly inserted into an [`axum::Router`],
     /// as it requires a [`HandleErrorLayer`] to handle rate limiting errors.
@@ -639,7 +655,8 @@ where
         Stack::new(self.build(), HandleErrorLayer::new(cb))
     }
 
-    /// Create a new rate limiter layer with the default error-handler callback that simply returns the error.
+    /// Create a new rate limiter layer with the default error-handler callback that simply returns the error
+    /// as a [`Response`].
     ///
     /// Returns a [`Stack`]-ed layer with the rate limiter layer and the error-handler layer combined
     /// that can be directly inserted into an [`axum::Router`].
@@ -650,54 +667,70 @@ where
         HandleErrorLayer<impl Fn(Error<Infallible, K::Rejection>) -> Ready<Response> + Clone, ()>,
     >
     where
-        Error<Infallible, K::Rejection>: IntoResponse,
+        K::Rejection: IntoResponse,
     {
         self.handle_error(|e| core::future::ready(e.into_response()))
     }
 }
 
-/// [`Request`] extension to access the internal rate limiter used during that request,
-/// such as to apply a penalty or reset the rate limit.
-#[derive(Clone)]
-pub struct RateLimiter<T: Hash + Eq = ()> {
-    key: RouteWithKey<T>,
-    limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
-}
+/// Defines the [`RateLimiter`](extensions::RateLimiter) extension for the request's extensions,
+/// extractable with [`Extension<RateLimiter<Key>>`](axum::extract::Extension).
+pub mod extensions {
+    use super::*;
 
-impl<T: Hash + Eq> RateLimiter<T> {
-    /// Get the key used to identify the rate limiter entry.
-    #[inline(always)]
-    pub fn key(&self) -> &T {
-        &self.key.key
+    /// [`Request`] extension to access the internal rate limiter used during that request,
+    /// such as to apply a penalty or reset the rate limit.
+    #[derive(Clone)]
+    pub struct RateLimiter<T: Hash + Eq = ()> {
+        pub(crate) key: RouteWithKey<T>,
+        pub(crate) limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
     }
 
-    /// See [`gcra::RateLimiter::penalize`] for more information.
-    pub async fn penalize(&self, penalty: Duration) -> bool {
-        self.limiter.penalize(&self.key, penalty).await
-    }
+    impl<T: Hash + Eq> RateLimiter<T> {
+        /// Get the key used to identify the rate limiter entry.
+        #[inline(always)]
+        pub fn key(&self) -> &T {
+            &self.key.key
+        }
 
-    /// See [`gcra::RateLimiter::penalize_sync`] for more information.
-    pub fn penalize_sync(&self, penalty: Duration) -> bool {
-        self.limiter.penalize_sync(&self.key, penalty)
-    }
+        /// Get the path of the route that was rate limited.
+        pub fn path(&self) -> &str {
+            &self.key.path
+        }
 
-    /// See [`gcra::RateLimiter::reset`] for more information.
-    pub async fn reset(&self) -> bool {
-        self.limiter.reset(&self.key).await
-    }
+        /// Get the method of the route that was rate limited.
+        pub fn method(&self) -> &Method {
+            &self.key.method
+        }
 
-    /// See [`gcra::RateLimiter::reset_sync`] for more information.
-    pub fn reset_sync(&self) -> bool {
-        self.limiter.reset_sync(&self.key)
-    }
+        /// See [`gcra::RateLimiter::penalize`] for more information.
+        pub async fn penalize(&self, penalty: Duration) -> bool {
+            self.limiter.penalize(&self.key, penalty).await
+        }
 
-    /// See [`gcra::RateLimiter::clean`] for more information.
-    pub async fn clean(&self, before: Instant) {
-        self.limiter.clean(before).await;
-    }
+        /// See [`gcra::RateLimiter::penalize_sync`] for more information.
+        pub fn penalize_sync(&self, penalty: Duration) -> bool {
+            self.limiter.penalize_sync(&self.key, penalty)
+        }
 
-    /// See [`gcra::RateLimiter::clean_sync`] for more information.
-    pub fn clean_sync(&self, before: Instant) {
-        self.limiter.clean_sync(before);
+        /// See [`gcra::RateLimiter::reset`] for more information.
+        pub async fn reset(&self) -> bool {
+            self.limiter.reset(&self.key).await
+        }
+
+        /// See [`gcra::RateLimiter::reset_sync`] for more information.
+        pub fn reset_sync(&self) -> bool {
+            self.limiter.reset_sync(&self.key)
+        }
+
+        /// See [`gcra::RateLimiter::clean`] for more information.
+        pub async fn clean(&self, before: Instant) {
+            self.limiter.clean(before).await;
+        }
+
+        /// See [`gcra::RateLimiter::clean_sync`] for more information.
+        pub fn clean_sync(&self, before: Instant) {
+            self.limiter.clean_sync(before);
+        }
     }
 }

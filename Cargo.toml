@@ -12,6 +12,8 @@ keywords = ["axum", "rate-limiting", "middleware", "gcra"]
 categories = ["web-programming"]
 
 [features]
+default = ["tokio", "real_ip"]
+
 tokio = ["dep:tokio", "axum/tokio"]
 real_ip = ["tokio", "dep:async-trait"]
 

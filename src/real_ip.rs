@@ -3,6 +3,7 @@
 use axum::{extract::FromRequestParts, response::IntoResponse};
 use http::{header::HeaderName, request::Parts, HeaderValue, StatusCode};
 use std::{
+    fmt::{self, Debug, Display},
     hash::Hash,
     net::{IpAddr, SocketAddr},
     ops::Deref,
@@ -11,7 +12,7 @@ use std::{
 
 /// Wrapper around `std::net::IpAddr` that can be extracted from the request parts.
 ///
-/// This extractor will try to get the real IP address of the client, using the following headers:
+/// This extractor will try to get the real IP address of the client, using the following headers, in order:
 /// - `x-forwarded-for`
 /// - `x-real-ip`
 /// - `client-ip` (used by some load balancers)
@@ -19,12 +20,31 @@ use std::{
 /// - `cf-connecting-ip` (used by Cloudflare sometimes)
 ///
 /// If none of these headers are found, it will return a 400 Bad Request via [`IpAddrRejection`],
-/// or the error can be handled with a custom rejection handler with [`RateLimitLayerBuilder::handle_error`](crate::RateLimitLayerBuilder::handle_error).
+/// or the error can be handled with a custom rejection handler with
+/// [`RateLimitLayerBuilder::handle_error`](crate::RateLimitLayerBuilder::handle_error).
 ///
-/// If the `tokio` feature is enabled, it will also try to get the IP address from the underlying socket via the `ConnectInfo` extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// If the `tokio` feature is enabled AND the `Router` is configured with
+/// [`Router::into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info),
+/// it will also try to get the IP address from the underlying socket via the [`ConnectInfo`](axum::extract::ConnectInfo) extension.
+/// This is optional as it may not work as expected if the server is behind a reverse proxy.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct RealIp(pub IpAddr);
+
+impl Debug for RealIp {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
+
+impl Display for RealIp {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
 
 impl Deref for RealIp {
     type Target = IpAddr;
