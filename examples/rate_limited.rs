@@ -1,5 +1,5 @@
-#[cfg(not(feature = "timed_gc"))]
-compile_error!("This example requires the 'timed_gc' feature to be enabled.");
+#[cfg(not(feature = "tokio"))]
+compile_error!("This example requires the 'tokio' feature to be enabled.");
 
 use std::time::Duration;
 

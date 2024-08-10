@@ -7,11 +7,12 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 include = ["src/**/*", "LICENSE-*", "README.md"]
 repository = "https://github.com/Lantern-chat/axum_gcra"
+documentation = "https://docs.rs/axum_gcra"
 keywords = ["axum", "rate-limiting", "middleware", "gcra"]
 categories = ["web-programming"]
 
 [features]
-timed_gc = ["dep:tokio"]
+tokio = ["dep:tokio"]
 
 [dependencies]
 tower = "0.4"

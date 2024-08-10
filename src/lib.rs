@@ -29,14 +29,14 @@ pub use gcra::RateLimitError;
 ///
 /// The default is 8192 requests.
 ///
-/// Time durations require the `timed_gc` cargo feature to be enabled.
+/// Time durations require the `tokio` cargo feature to be enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GCInterval {
     /// Run garbage collection after a number of requests.
     Requests(u64),
 
     /// Run garbage collection on a timed interval using a background task.
-    #[cfg(feature = "timed_gc")]
+    #[cfg(feature = "tokio")]
     Time(Duration),
 }
 
@@ -51,7 +51,7 @@ impl GCInterval {
         match self {
             GCInterval::Requests(n) => n,
 
-            #[cfg(feature = "timed_gc")]
+            #[cfg(feature = "tokio")]
             GCInterval::Time(_) => u64::MAX,
         }
     }
@@ -63,7 +63,7 @@ impl From<u64> for GCInterval {
     }
 }
 
-#[cfg(feature = "timed_gc")]
+#[cfg(feature = "tokio")]
 impl From<Duration> for GCInterval {
     fn from(d: Duration) -> Self {
         GCInterval::Time(d)
@@ -213,7 +213,7 @@ pub struct RateLimitService<S, K: GetKey = ()> {
     layer: RateLimitLayer<K>,
 }
 
-#[cfg(feature = "timed_gc")]
+#[cfg(feature = "tokio")]
 #[derive(Default, Clone)]
 struct BuilderDropNotify {
     notify: Arc<tokio::sync::Notify>,
@@ -230,13 +230,13 @@ pub struct RateLimitLayerBuilder<K: GetKey = ()> {
     get_key: K,
     gc_interval: GCInterval,
 
-    #[cfg(feature = "timed_gc")]
+    #[cfg(feature = "tokio")]
     shutdown: BuilderDropNotify,
 }
 
 impl<K: GetKey> Drop for RateLimitLayerBuilder<K> {
     fn drop(&mut self) {
-        #[cfg(feature = "timed_gc")]
+        #[cfg(feature = "tokio")]
         self.shutdown.notify.notify_waiters();
     }
 }
@@ -344,7 +344,7 @@ impl<K: GetKey> RateLimitLayer<K> {
             get_key,
             gc_interval: GCInterval::default(),
 
-            #[cfg(feature = "timed_gc")]
+            #[cfg(feature = "tokio")]
             shutdown: BuilderDropNotify::default(),
         }
     }
@@ -410,7 +410,7 @@ impl<K: GetKey> RateLimitLayerBuilder<K> {
     ///
     /// The default is 8192 requests.
     ///
-    /// If the `timed_gc` feature is enabled, this can also be a time [`Duration`],
+    /// If the `tokio` feature is enabled, this can also be a time [`Duration`],
     /// and a background task will be spawned to clean the rate limiter at the given interval.
     pub fn set_gc_interval(mut self, gc_interval: impl Into<GCInterval>) -> Self {
         self.gc_interval = gc_interval.into();
@@ -430,7 +430,7 @@ impl<K: GetKey> RateLimitLayerBuilder<K> {
             get_key,
             gc_interval: self.gc_interval,
 
-            #[cfg(feature = "timed_gc")]
+            #[cfg(feature = "tokio")]
             shutdown: std::mem::take(&mut self.shutdown),
         }
     }
@@ -571,7 +571,7 @@ where
 {
     /// Build the [`RateLimitLayer`].
     ///
-    /// This will create a new rate limiter and, if the `timed_gc` feature is
+    /// This will create a new rate limiter and, if the `tokio` feature is
     /// enabled and the interval is a time [`Duration`], spawn a background task for
     /// garbage collection.
     ///
@@ -585,7 +585,7 @@ where
             Default::default(),
         ));
 
-        #[cfg(feature = "timed_gc")]
+        #[cfg(feature = "tokio")]
         if let GCInterval::Time(d) = self.gc_interval {
             let limiter = limiter.clone();
             let signal = self.shutdown.clone();
