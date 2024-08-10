@@ -3,7 +3,10 @@ compile_error!("This example requires the 'timed_gc' feature to be enabled.");
 
 use std::time::Duration;
 
-use axum::{extract::Request, routing::get, Router};
+use axum::{
+    extract::Extension,
+    routing::{get, post, Router},
+};
 use axum_gcra::{gcra::Quota, RateLimitLayer, RateLimiter};
 use http::Method;
 
@@ -14,19 +17,28 @@ async fn main() {
         .route("/build", get(|| async { "Build info" }))
         .route(
             "/penalize",
-            get(|req: Request| async move {
-                let rl = req.extensions().get::<RateLimiter<()>>().unwrap();
-                rl.penalize_sync(Duration::from_secs(50));
+            get(|rl: Extension<RateLimiter>| async move {
+                rl.penalize(Duration::from_secs(50)).await;
 
                 "Penalized"
             }),
         )
+        .route(
+            "/reset",
+            post(|rl: Extension<RateLimiter>| async move {
+                rl.reset().await;
+
+                "Reset"
+            }),
+        )
         .route_layer(
+            // NOTE: A macro could be used to simplify this
             RateLimitLayer::builder()
                 .set_default_quota(Quota::simple(Duration::from_secs(5)))
-                .with_quota("/build", Method::GET, Quota::simple(Duration::from_secs(2)))
-                .with_extension(true)
-                .set_root_fallback(true)
+                .with_quota((Method::GET, "/build"), Quota::simple(Duration::from_secs(2)))
+                .with_quota((Method::POST, "/reset"), Quota::simple(Duration::from_millis(1)))
+                .with_extension(true) // required for the `Extension` extractor to work
+                .set_global_fallback(true)
                 .set_gc_interval(Duration::from_secs(5))
                 .default_handle_error(),
         );
