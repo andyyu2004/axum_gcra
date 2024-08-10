@@ -1,7 +1,7 @@
 axum_gcra
 =========
 
-GCRA-based Rate Limiter for Axum with per-route/per-key rate limiting
+GCRA-based Rate Limiter for Axum with per-route/per-key rate limiting.
 
 [![crates.io](https://img.shields.io/crates/v/axum_gcra.svg)](https://crates.io/crates/axum_gcra)
 [![Documentation](https://docs.rs/axum_gcra/badge.svg)](https://docs.rs/axum_gcra)
@@ -11,7 +11,7 @@ GCRA-based Rate Limiter for Axum with per-route/per-key rate limiting
 
 This crate provides a robust implementation of a rate-limiting `Layer` and `Service` for `axum` using the
 GCRA algorithm, which allows for average throughput and burst request limiting. Rather than providing a global
-rate-limited for all routes, this crate allows for individual routes/paths to be configured with separate
+rate-limiter for all routes, this crate allows for individual routes/paths to be configured with separate
 rate-limiting quotas and for the extraction of arbitrary keys from the request for additional compartmentalization.
 
 For example:
@@ -19,7 +19,7 @@ For example:
 use std::time::Duration;
 
 use axum::{routing::get, Router, http::Method};
-use axum_gcra::{gcra::Quota, RateLimitLayer};
+use axum_gcra::{gcra::Quota, RateLimitLayer, real_ip::RealIp};
 
 #[tokio::main]
 async fn main() {
@@ -27,7 +27,7 @@ async fn main() {
         .route("/", get(|| async { "Hello, World!" }))
         .route("/hello", get(|| async { "Hello, Again!" }))
         .route_layer(
-            RateLimitLayer::<()>::builder()
+            RateLimitLayer::<RealIp>::builder()
                 .with_default_quota(Quota::simple(Duration::from_secs(5)))
                 .with_route((Method::GET, "/"), Quota::simple(Duration::from_secs(1)))
                 .with_route((Method::GET, "/hello"), Quota::simple(Duration::from_secs(2)))
@@ -69,19 +69,19 @@ Please read the documentation for `RealIp` for more information.
 # Garbage Collection
 
 Internally, the rate limiter uses a shared hash map structure to store the state of each key. To avoid
-it growing indefinitely, a garbage collection mechanism is provided that will remove keys that have
-not been accessed for a certain period of time. This can be configured to run based on the number of
+it growing indefinitely, a garbage collection mechanism is provided that will remove entries that have
+expired and no longer needed. This can be configured to run based on the number of
 requests processed or on a fixed time interval in a background task. For example:
 
 ```rust,no_run
 use std::time::Duration;
 use axum::{routing::get, Router};
-use axum_gcra::{RateLimitLayer};
+use axum_gcra::{RateLimitLayer, real_ip::RealIp};
 
 let app = Router::<()>::new()
     .route("/", get(|| async { "Hello, World!" }))
     .route_layer(
-        RateLimitLayer::<()>::builder()
+        RateLimitLayer::<RealIp>::builder()
             .with_gc_interval(1000) // run GC on every 1000th request
             .with_gc_interval(Duration::from_secs(60)) // or run every 60 seconds
             .default_handle_error(),
