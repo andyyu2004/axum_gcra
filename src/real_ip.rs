@@ -20,6 +20,8 @@ use std::{
 ///
 /// If none of these headers are found, it will return a 400 Bad Request via [`IpAddrRejection`],
 /// or the error can be handled with a custom rejection handler with [`RateLimitLayerBuilder::handle_error`](crate::RateLimitLayerBuilder::handle_error).
+///
+/// If the `tokio` feature is enabled, it will also try to get the IP address from the underlying socket via the `ConnectInfo` extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct RealIp(pub IpAddr);
