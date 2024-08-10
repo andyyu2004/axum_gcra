@@ -1,3 +1,6 @@
+//! Lower-level rate limiter implementation using the Generic Cell Rate Algorithm (GCRA) and
+//! an asynchronous hash map for concurrent access.
+
 use std::{
     borrow::Borrow,
     error::Error,
@@ -98,7 +101,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
     }
 
     /// Variant of [`RateLimiter::req`] that allows for a peek at the key after it's been inserted.
-    pub(crate) fn req_sync_peek_key<F>(
+    pub(crate) async fn req_peek_key<F>(
         &self,
         key: K,
         quota: Quota,
@@ -111,22 +114,27 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         let now = self.relative(now);
         let mut peek = Some(peek);
 
+        let read = self
+            .limits
+            .read_async(&key, |_, gcra| {
+                gcra.req(quota, now)?;
+                let peek = unsafe { peek.take().unwrap_unchecked() }; // SAFETY: peek is Some
+                peek(&key);
+                Ok(())
+            })
+            .await;
+
         // if read returns Some, then peek was consumed
-        let Some(res) = self.limits.read(&key, |_, gcra| {
-            gcra.req(quota, now)?;
-            let peek = unsafe { peek.take().unwrap_unchecked() }; // SAFETY: peek is Some
-            peek(&key);
-            Ok(())
-        }) else {
+        let Some(res) = read else {
             // otherwise we're free to unwrap it and use it here normally
             let peek = unsafe { peek.unwrap_unchecked() };
 
             // since we hit the slow path, perform garbage collection
             if self.should_gc() {
-                self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
+                self.limits.retain_async(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now).await;
             }
 
-            return match self.limits.entry(key) {
+            return match self.limits.entry_async(key).await {
                 Entry::Occupied(gcra) => {
                     gcra.get().req(quota, now)?;
                     peek(gcra.key());

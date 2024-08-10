@@ -26,9 +26,9 @@ async fn main() {
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
         .route_layer(
-            RateLimitLayer::builder()
-                .set_default_quota(Quota::simple(Duration::from_secs(5)))
-                .set_global_fallback(true)
+            RateLimitLayer::<()>::builder()
+                .with_default_quota(Quota::simple(Duration::from_secs(5)))
+                .with_global_fallback(true)
                 .with_extension(true)
                 .default_handle_error(),
         );

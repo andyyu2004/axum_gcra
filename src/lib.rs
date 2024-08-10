@@ -16,10 +16,22 @@ use std::{
 
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::{MatchedPath as AxumMatchedPath, Request},
+    extract::{FromRequestParts, MatchedPath as AxumMatchedPath, Request},
+    response::{IntoResponse, Response},
 };
 use http::{request::Parts, Extensions, Method};
 use tower::{Layer, Service};
+
+#[cfg(feature = "real_ip")]
+pub mod real_ip;
+
+/// Trait for user-provided keys used to identify rate limiter entries.
+///
+/// Keys should be uniquely identifiable to avoid rate limiting other users,
+/// e.g. using a user ID or IP address.
+pub trait Key: Hash + Eq + Send + Sync + 'static {}
+
+impl<T> Key for T where T: Hash + Eq + Send + Sync + 'static {}
 
 pub mod gcra;
 pub use gcra::RateLimitError;
@@ -77,11 +89,11 @@ pub struct Route<'a> {
     pub path: Cow<'a, str>,
 }
 
-impl<'a, S> From<(Method, S)> for Route<'a>
+impl<'a, P> From<(Method, P)> for Route<'a>
 where
-    S: Into<Cow<'a, str>>,
+    P: Into<Cow<'a, str>>,
 {
-    fn from((method, path): (Method, S)) -> Self {
+    fn from((method, path): (Method, P)) -> Self {
         Self {
             path: path.into(),
             method: Cow::Owned(method),
@@ -168,48 +180,13 @@ impl Hash for MatchedPath {
     }
 }
 
-/// Defines a trait for extracting a key from a request.
-///
-/// This is similar to [`FromRequestParts`](axum::extract::FromRequestParts), but is always
-/// infallible and synchronous.
-pub trait GetKey {
-    /// The type of the key extracted from the request.
-    type T: Hash + Eq + Send + Sync + 'static;
-
-    /// Extract a key from the request.
-    ///
-    /// For example, this could be the IP address of the client, or a user/session ID, or
-    /// any other value that uniquely identifies the client.
-    fn get_key(&self, req: &Parts) -> Self::T;
-}
-
-impl GetKey for () {
-    type T = ();
-
-    #[inline]
-    fn get_key(&self, _: &Parts) {}
-}
-
-impl<F, T> GetKey for F
-where
-    F: Fn(&Parts) -> T,
-    T: Hash + Eq + Send + Sync + 'static,
-{
-    type T = T;
-
-    #[inline]
-    fn get_key(&self, req: &Parts) -> T {
-        self(req)
-    }
-}
-
 /// Rate limiter [`Service`] for axum.
 ///
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
 ///
 /// Note: The limiter is shared across all clones of the layer and service.
-pub struct RateLimitService<S, K: GetKey = ()> {
-    inner: S,
+pub struct RateLimitService<I, K: Key = ()> {
+    inner: I,
     layer: RateLimitLayer<K>,
 }
 
@@ -222,19 +199,18 @@ struct BuilderDropNotify {
 /// Builder for the rate limiter layer.
 ///
 /// This struct is used to configure the rate limiter before building it.
-pub struct RateLimitLayerBuilder<K: GetKey = ()> {
+pub struct RateLimitLayerBuilder<K = ()> {
     quotas: Quotas,
     default_quota: gcra::Quota,
-    set_ext: Option<Box<dyn SetExtension<K::T>>>,
+    set_ext: Option<Box<dyn SetExtension<K>>>,
     global_fallback: bool,
-    get_key: K,
     gc_interval: GCInterval,
 
     #[cfg(feature = "tokio")]
     shutdown: BuilderDropNotify,
 }
 
-impl<K: GetKey> Drop for RateLimitLayerBuilder<K> {
+impl<K> Drop for RateLimitLayerBuilder<K> {
     fn drop(&mut self) {
         #[cfg(feature = "tokio")]
         self.shutdown.notify.notify_waiters();
@@ -246,9 +222,9 @@ impl<K: GetKey> Drop for RateLimitLayerBuilder<K> {
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
 ///
 /// Note: The limiter is shared across all clones of the layer and service.
-pub struct RateLimitLayer<K: GetKey = ()> {
+pub struct RateLimitLayer<K: Key = ()> {
     builder: Arc<RateLimitLayerBuilder<K>>,
-    limiter: Arc<gcra::RateLimiter<RouteWithKey<K::T>, ahash::RandomState>>,
+    limiter: Arc<gcra::RateLimiter<RouteWithKey<K>, ahash::RandomState>>,
 }
 
 /// Object-safe trait for setting an extension on a request.
@@ -283,7 +259,7 @@ where
     }
 }
 
-impl<K: GetKey> Clone for RateLimitLayer<K> {
+impl<K: Key> Clone for RateLimitLayer<K> {
     fn clone(&self) -> Self {
         Self {
             limiter: self.limiter.clone(),
@@ -292,7 +268,7 @@ impl<K: GetKey> Clone for RateLimitLayer<K> {
     }
 }
 
-impl<S: Clone, K: GetKey> Clone for RateLimitService<S, K> {
+impl<I: Clone, K: Key> Clone for RateLimitService<I, K> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -301,63 +277,57 @@ impl<S: Clone, K: GetKey> Clone for RateLimitService<S, K> {
     }
 }
 
-impl<S, K: GetKey> RateLimitService<S, K> {
-    fn req_sync_peek_key<F>(
+impl<K: Key> RateLimitLayer<K> {
+    async fn req_peek_key<F>(
         &self,
-        mut key: RouteWithKey<K::T>,
+        mut key: RouteWithKey<K>,
         now: std::time::Instant,
         peek: F,
     ) -> Result<(), RateLimitError>
     where
-        F: FnOnce(&RouteWithKey<K::T>),
+        F: FnOnce(&RouteWithKey<K>),
     {
-        let builder = &self.layer.builder;
-
         let quota_key = Route {
             path: Cow::Borrowed(&*key.path),
             method: Cow::Borrowed(&key.method),
         };
 
-        let quota = match builder.quotas.get(&quota_key).copied() {
+        let quota = match self.builder.quotas.get(&quota_key).copied() {
             Some(quota) => quota,
             None => {
-                if builder.global_fallback {
+                if self.builder.global_fallback {
                     key.path = MatchedPath::Fallback;
                 }
 
-                builder.default_quota
+                self.builder.default_quota
             }
         };
 
-        self.layer.limiter.req_sync_peek_key(key, quota, now, peek)
+        self.limiter.req_peek_key(key, quota, now, peek).await
     }
 }
 
-impl<K: GetKey> RateLimitLayer<K> {
-    /// Begin building a new rate limiter layer starting with a key extractor.
-    pub fn builder_with_key(get_key: K) -> RateLimitLayerBuilder<K> {
+impl<K: Key> RateLimitLayer<K> {
+    /// Begin building a new rate limiter layer starting with the default configuration.
+    pub fn builder() -> RateLimitLayerBuilder<K> {
+        RateLimitLayerBuilder::new()
+    }
+}
+
+impl<K: Key> RateLimitLayerBuilder<K> {
+    pub fn new() -> Self {
         RateLimitLayerBuilder {
             quotas: Default::default(),
             default_quota: Default::default(),
             set_ext: None,
             global_fallback: false,
-            get_key,
             gc_interval: GCInterval::default(),
 
             #[cfg(feature = "tokio")]
             shutdown: BuilderDropNotify::default(),
         }
     }
-}
 
-impl RateLimitLayer<()> {
-    /// Begin building a new rate limiter layer starting with the default configuration.
-    pub fn builder() -> RateLimitLayerBuilder<()> {
-        Self::builder_with_key(())
-    }
-}
-
-impl<K: GetKey> RateLimitLayerBuilder<K> {
     /// Insert a route entry into the quota table for the rate limiter.
     pub fn add_quota(&mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) {
         self.add_quotas(Some((route.into(), quota)));
@@ -383,24 +353,14 @@ impl<K: GetKey> RateLimitLayerBuilder<K> {
         self
     }
 
-    /// Set the quota table for the rate limiter, replacing any existing routes and quotas.
-    pub fn set_quotas(
-        mut self,
-        quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>,
-    ) -> Self {
-        self.quotas.clear();
-        self.add_quotas(quotas);
-        self
-    }
-
     /// Fallback quota for rate limiting if no specific quota is found for the path.
-    pub fn set_default_quota(mut self, default_quota: gcra::Quota) -> Self {
+    pub fn with_default_quota(mut self, default_quota: gcra::Quota) -> Self {
         self.default_quota = default_quota;
         self
     }
 
     /// Set whether to use a global fallback shared rate-limiter for all paths not explicitly defined.
-    pub fn set_global_fallback(mut self, global_fallback: bool) -> Self {
+    pub fn with_global_fallback(mut self, global_fallback: bool) -> Self {
         self.global_fallback = global_fallback;
         self
     }
@@ -412,34 +372,30 @@ impl<K: GetKey> RateLimitLayerBuilder<K> {
     ///
     /// If the `tokio` feature is enabled, this can also be a time [`Duration`],
     /// and a background task will be spawned to clean the rate limiter at the given interval.
-    pub fn set_gc_interval(mut self, gc_interval: impl Into<GCInterval>) -> Self {
+    pub fn with_gc_interval(mut self, gc_interval: impl Into<GCInterval>) -> Self {
         self.gc_interval = gc_interval.into();
         self
     }
 
-    /// Provide a function to extract a key from the request.
-    pub fn with_key<K2>(mut self, get_key: K2) -> RateLimitLayerBuilder<K2>
-    where
-        K2: GetKey,
-    {
-        RateLimitLayerBuilder {
-            quotas: std::mem::take(&mut self.quotas),
-            default_quota: self.default_quota,
-            set_ext: None,
-            global_fallback: self.global_fallback,
-            get_key,
-            gc_interval: self.gc_interval,
-
-            #[cfg(feature = "tokio")]
-            shutdown: std::mem::take(&mut self.shutdown),
-        }
-    }
-
     /// Set whether to insert the [`RateLimiter`] into the request's extensions
     /// to allow for manual rate limiting control.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// use axum::{extract::Extension, routing::get, Router};
+    /// use axum_gcra::{RateLimitLayer, RateLimiter};
+    ///
+    /// let app = Router::<()>::new()
+    ///     // access the rate limiter for this request
+    ///     .route("/", get(|rl: Extension<RateLimiter>| async move {
+    ///         rl.penalize(Duration::from_secs(50)).await;
+    ///     }))
+    ///     .route_layer(RateLimitLayer::<()>::builder().with_extension(true).default_handle_error());
     pub fn with_extension(mut self, extend: bool) -> Self
     where
-        K::T: Clone + Send + Sync + 'static,
+        K: Clone,
     {
         self.set_ext = match extend {
             true => Some(Box::new(DoSetExtension)),
@@ -457,7 +413,7 @@ impl Default for RateLimitLayerBuilder<()> {
 
 /// Error wrapper for rate limiting errors or inner service errors.
 #[derive(Debug)]
-pub enum Error<Inner> {
+pub enum Error<Inner, Rejection> {
     /// Inner service error.
     ///
     /// For most axum services, this will be a [`Infallible`].
@@ -468,44 +424,77 @@ pub enum Error<Inner> {
     /// This error is returned when the rate limiter has blocked the request,
     /// and will be passed to the [error handler](RateLimitLayerBuilder::handle_error).
     RateLimit(RateLimitError),
+
+    /// Key extraction rejection.
+    KeyRejection(Rejection),
 }
 
-use futures_util::TryFuture;
-
-pin_project_lite::pin_project! {
-    #[doc(hidden)]
-    #[project = RateLimitedResponseProj]
-    pub enum RateLimitedResponse<F> {
-        Ok { #[pin] f: F },
-        Err { e: RateLimitError },
-    }
-}
-
-impl<F> Future for RateLimitedResponse<F>
+impl<Inner, Rejection> IntoResponse for Error<Inner, Rejection>
 where
-    F: TryFuture,
+    Inner: IntoResponse,
+    Rejection: IntoResponse,
 {
-    type Output = Result<F::Ok, Error<F::Error>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.project() {
-            RateLimitedResponseProj::Ok { f } => match ready!(f.try_poll(cx)) {
-                Ok(ok) => Poll::Ready(Ok(ok)),
-                Err(e) => Poll::Ready(Err(Error::Inner(e))),
-            },
-            RateLimitedResponseProj::Err { e } => Poll::Ready(Err(Error::RateLimit(*e))),
+    fn into_response(self) -> Response {
+        match self {
+            Error::RateLimit(e) => e.into_response(),
+            Error::KeyRejection(e) => e.into_response(),
+            Error::Inner(e) => e.into_response(),
         }
     }
 }
 
-impl<S, K, B> Service<Request<B>> for RateLimitService<S, K>
+use futures_util::{future::BoxFuture, TryFuture};
+
+pin_project_lite::pin_project! {
+    #[doc(hidden)]
+    #[project = RateLimitedResponseProj]
+    pub enum RateLimitedResponse<B, I: Service<Request<B>>, K: FromRequestParts<()>> {
+        RateLimiting {
+            #[pin] f: BoxFuture<'static, Result<Parts, Error<I::Error, K::Rejection>>>,
+
+            inner: I, // storing I separately helps avoid an I: Sync bound
+            body: Option<B>, // similar story, helps avoid B: Send + 'static bound
+        },
+
+        Inner { #[pin] f: I::Future },
+    }
+}
+
+impl<B, I, K> Future for RateLimitedResponse<B, I, K>
 where
-    S: Service<Request<B>, Future: TryFuture<Ok = S::Response, Error = S::Error>>,
-    K: GetKey,
+    I: Service<Request<B>, Future: TryFuture<Ok = I::Response, Error = I::Error>>,
+    K: FromRequestParts<()>,
 {
-    type Response = S::Response;
-    type Error = Error<S::Error>;
-    type Future = RateLimitedResponse<S::Future>;
+    type Output = Result<I::Response, Error<I::Error, K::Rejection>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match self.as_mut().project() {
+                RateLimitedResponseProj::RateLimiting { inner, body, f } => match ready!(f.try_poll(cx)) {
+                    Ok(req) => {
+                        let req = Request::from_parts(req, body.take().expect("body is Some"));
+                        let f = inner.call(req);
+                        self.set(RateLimitedResponse::Inner { f })
+                    }
+                    Err(e) => return Poll::Ready(Err(e)),
+                },
+                RateLimitedResponseProj::Inner { f } => match ready!(f.try_poll(cx)) {
+                    Ok(ok) => return Poll::Ready(Ok(ok)),
+                    Err(e) => return Poll::Ready(Err(Error::Inner(e))),
+                },
+            }
+        }
+    }
+}
+
+impl<I, K, B> Service<Request<B>> for RateLimitService<I, K>
+where
+    I: Service<Request<B>, Future: TryFuture<Ok = I::Response, Error = I::Error>> + Clone + Send + 'static,
+    K: Key + FromRequestParts<()>,
+{
+    type Response = I::Response;
+    type Error = Error<I::Error, K::Rejection>;
+    type Future = RateLimitedResponse<B, I, K>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.inner.poll_ready(cx) {
@@ -516,46 +505,57 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let now = std::time::Instant::now();
+        // try to get the current time as close as possible to the request
+        let now = Instant::now();
 
         let path = match req.extensions().get::<AxumMatchedPath>() {
             Some(path) => MatchedPath::Axum(path.clone()),
             None => MatchedPath::Fallback,
         };
 
-        let builder = &self.layer.builder;
-
         let (mut parts, body) = req.into_parts();
 
-        let key = RouteWithKey {
-            path,
-            method: parts.method.clone(),
-            key: builder.get_key.get_key(&parts),
-        };
+        let layer = self.layer.clone();
 
-        let res = self.req_sync_peek_key(key, now, |key| {
-            if let Some(ref set_ext) = builder.set_ext {
-                // set_extension will clone the key internally
-                set_ext.set_extension(&mut parts.extensions, key, self.layer.limiter.clone());
-            }
-        });
+        RateLimitedResponse::RateLimiting {
+            inner: self.inner.clone(),
+            body: Some(body), // once told me
 
-        match res {
-            Err(e) => RateLimitedResponse::Err { e },
-            Ok(()) => RateLimitedResponse::Ok {
-                f: self.inner.call(Request::from_parts(parts, body)),
-            },
+            f: Box::pin(async move {
+                let user_key = match K::from_request_parts(&mut parts, &()).await {
+                    Ok(key) => key,
+                    Err(rejection) => return Err(Error::KeyRejection(rejection)),
+                };
+
+                let key = RouteWithKey {
+                    key: user_key,
+                    path,
+                    method: parts.method.clone(),
+                };
+
+                let res = layer.req_peek_key(key, now, |key| {
+                    if let Some(ref set_ext) = layer.builder.set_ext {
+                        // set_extension will clone the key internally
+                        set_ext.set_extension(&mut parts.extensions, key, layer.limiter.clone());
+                    }
+                });
+
+                match res.await {
+                    Ok(()) => Ok(parts),
+                    Err(e) => Err(Error::RateLimit(e)),
+                }
+            }),
         }
     }
 }
 
-impl<K, S> Layer<S> for RateLimitLayer<K>
+impl<K, I> Layer<I> for RateLimitLayer<K>
 where
-    K: GetKey,
+    K: Key,
 {
-    type Service = RateLimitService<S, K>;
+    type Service = RateLimitService<I, K>;
 
-    fn layer(&self, inner: S) -> Self::Service {
+    fn layer(&self, inner: I) -> Self::Service {
         RateLimitService {
             inner,
             layer: self.clone(),
@@ -567,7 +567,7 @@ use tower::layer::util::Stack;
 
 impl<K> RateLimitLayerBuilder<K>
 where
-    K: GetKey,
+    K: Key + FromRequestParts<()>,
 {
     /// Build the [`RateLimitLayer`].
     ///
@@ -625,27 +625,18 @@ where
     /// use axum::{Router, http::StatusCode};
     /// use axum_gcra::RateLimitLayer;
     ///
-    /// let builder = RateLimitLayer::builder();
+    /// let builder = RateLimitLayer::<()>::builder();
     ///
     /// let app = Router::<()>::new().route_layer(
     ///    builder.handle_error(|e| async move {
-    ///       (StatusCode::TOO_MANY_REQUESTS, e.to_string())
+    ///       StatusCode::TOO_MANY_REQUESTS
     ///    }));
     /// ```
-    pub fn handle_error<F, R>(
-        self,
-        cb: F,
-    ) -> Stack<RateLimitLayer<K>, HandleErrorLayer<impl Fn(Error<Infallible>) -> R + Clone, ()>>
+    pub fn handle_error<F, R>(self, cb: F) -> Stack<RateLimitLayer<K>, HandleErrorLayer<F, ()>>
     where
-        F: Fn(RateLimitError) -> R + Clone,
+        F: Fn(Error<Infallible, K::Rejection>) -> R + Clone,
     {
-        Stack::new(
-            self.build(),
-            HandleErrorLayer::new(move |e| match e {
-                Error::RateLimit(e) => cb(e),
-                Error::Inner(_) => unsafe { core::hint::unreachable_unchecked() },
-            }),
-        )
+        Stack::new(self.build(), HandleErrorLayer::new(cb))
     }
 
     /// Create a new rate limiter layer with the default error-handler callback that simply returns the error.
@@ -654,9 +645,14 @@ where
     /// that can be directly inserted into an [`axum::Router`].
     pub fn default_handle_error(
         self,
-    ) -> Stack<RateLimitLayer<K>, HandleErrorLayer<impl Fn(Error<Infallible>) -> Ready<RateLimitError> + Clone, ()>>
+    ) -> Stack<
+        RateLimitLayer<K>,
+        HandleErrorLayer<impl Fn(Error<Infallible, K::Rejection>) -> Ready<Response> + Clone, ()>,
+    >
+    where
+        Error<Infallible, K::Rejection>: IntoResponse,
     {
-        self.handle_error(std::future::ready)
+        self.handle_error(|e| core::future::ready(e.into_response()))
     }
 }
 
@@ -669,6 +665,12 @@ pub struct RateLimiter<T: Hash + Eq = ()> {
 }
 
 impl<T: Hash + Eq> RateLimiter<T> {
+    /// Get the key used to identify the rate limiter entry.
+    #[inline(always)]
+    pub fn key(&self) -> &T {
+        &self.key.key
+    }
+
     /// See [`gcra::RateLimiter::penalize`] for more information.
     pub async fn penalize(&self, penalty: Duration) -> bool {
         self.limiter.penalize(&self.key, penalty).await

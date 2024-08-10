@@ -2,7 +2,7 @@
 name = "axum_gcra"
 description = "GCRA-based Rate Limiter for Axum with per-route/per-key rate limiting"
 authors = ["novacrazy <novacrazy@gmail.com>"]
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 include = ["src/**/*", "LICENSE-*", "README.md"]
@@ -12,7 +12,8 @@ keywords = ["axum", "rate-limiting", "middleware", "gcra"]
 categories = ["web-programming"]
 
 [features]
-tokio = ["dep:tokio"]
+tokio = ["dep:tokio", "axum/tokio"]
+real_ip = ["tokio", "dep:async-trait"]
 
 [dependencies]
 tower = "0.4"
@@ -24,6 +25,7 @@ futures-util = "0.3.30"
 pin-project-lite = "0.2.14"
 
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
+async-trait = { version = "0.1.81", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.7", default-features = true }
