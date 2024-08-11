@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![warn(clippy::perf, clippy::style)]
 
 use std::{
     borrow::Cow,
@@ -21,6 +22,12 @@ use axum::{
 };
 use http::{request::Parts, Extensions, Method};
 use tower::{Layer, Service};
+
+#[cfg(feature = "ahash")]
+type RandomState = ahash::RandomState;
+
+#[cfg(not(feature = "ahash"))]
+type RandomState = std::collections::hash_map::RandomState;
 
 #[cfg(feature = "real_ip")]
 pub mod real_ip;
@@ -155,7 +162,7 @@ struct RouteWithKey<T> {
 }
 
 /// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router) to a [`gcra::Quota`].
-type Quotas = HashMap<Route<'static>, gcra::Quota, ahash::RandomState>;
+type Quotas = HashMap<Route<'static>, gcra::Quota, RandomState>;
 
 #[derive(Debug, Clone)]
 enum MatchedPath {
@@ -189,7 +196,7 @@ impl Eq for MatchedPath {}
 
 impl Hash for MatchedPath {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (**self).hash(state)
+        (**self).hash(state);
     }
 }
 
@@ -237,7 +244,7 @@ impl<K> Drop for RateLimitLayerBuilder<K> {
 /// Note: The limiter is shared across all clones of the layer and service.
 pub struct RateLimitLayer<K: Key = ()> {
     builder: Arc<RateLimitLayerBuilder<K>>,
-    limiter: Arc<gcra::RateLimiter<RouteWithKey<K>, ahash::RandomState>>,
+    limiter: Arc<gcra::RateLimiter<RouteWithKey<K>, RandomState>>,
 }
 
 /// Object-safe trait for setting an extension on a request.
@@ -249,7 +256,7 @@ trait SetExtension<T: Hash + Eq>: Send + Sync + 'static {
         &self,
         req: &mut Extensions,
         key: &RouteWithKey<T>,
-        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
+        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, RandomState>>,
     );
 }
 
@@ -263,7 +270,7 @@ where
         &self,
         req: &mut Extensions,
         key: &RouteWithKey<T>,
-        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
+        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, RandomState>>,
     ) {
         req.insert(extensions::RateLimiter {
             key: key.clone(),
@@ -292,12 +299,14 @@ impl<I: Clone, K: Key> Clone for RateLimitService<I, K> {
 
 impl<K: Key> RateLimitLayer<K> {
     /// Begin building a new rate limiter layer starting with the default configuration.
+    #[must_use]
     pub fn builder() -> RateLimitLayerBuilder<K> {
         RateLimitLayerBuilder::new()
     }
 }
 
 impl<K: Key> RateLimitLayerBuilder<K> {
+    #[must_use]
     pub fn new() -> Self {
         RateLimitLayerBuilder {
             quotas: Default::default(),
@@ -317,6 +326,7 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     }
 
     /// Insert a route entry into the quota table for the rate limiter.
+    #[must_use]
     pub fn with_route(mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) -> Self {
         self.add_route(route.into(), quota);
         self
@@ -328,6 +338,7 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     }
 
     /// Insert many route entries into the quota table for the rate limiter.
+    #[must_use]
     pub fn with_routes(
         mut self,
         quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>,
@@ -337,12 +348,14 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     }
 
     /// Fallback quota for rate limiting if no specific quota is found for the path.
+    #[must_use]
     pub fn with_default_quota(mut self, default_quota: gcra::Quota) -> Self {
         self.default_quota = default_quota;
         self
     }
 
     /// Set whether to use a global fallback shared rate-limiter for all paths not explicitly defined.
+    #[must_use]
     pub fn with_global_fallback(mut self, global_fallback: bool) -> Self {
         self.global_fallback = global_fallback;
         self
@@ -358,6 +371,7 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     /// and a background task will be spawned to clean the rate limiter at the
     /// given time interval. Cleanup is asynchronous and will not block the request
     /// in this case.
+    #[must_use]
     pub fn with_gc_interval(mut self, gc_interval: impl Into<GCInterval>) -> Self {
         self.gc_interval = gc_interval.into();
         self
@@ -382,6 +396,7 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     ///         rl.penalize(Duration::from_secs(50)).await;
     ///     }))
     ///     .route_layer(RateLimitLayer::<Key>::builder().with_extension(true).default_handle_error());
+    #[must_use]
     pub fn with_extension(mut self, extend: bool) -> Self
     where
         K: Clone,
@@ -598,10 +613,11 @@ where
     /// as it requires a [`HandleErrorLayer`] to handle rate limiting errors.
     /// Use [`RateLimitLayerBuilder::handle_error`] or [`RateLimitLayerBuilder::default_handle_error`] to create a stack
     /// with the rate limiter layer and the error-handler layer combined.
+    #[must_use]
     pub fn build(self) -> RateLimitLayer<K> {
         let limiter = Arc::new(gcra::RateLimiter::new(
             self.gc_interval.to_requests(),
-            Default::default(),
+            RandomState::default(),
         ));
 
         #[cfg(feature = "tokio")]
@@ -651,6 +667,7 @@ where
     ///       StatusCode::TOO_MANY_REQUESTS
     ///    }));
     /// ```
+    #[must_use]
     pub fn handle_error<F, R>(self, cb: F) -> Stack<RateLimitLayer<K>, HandleErrorLayer<F, ()>>
     where
         F: Fn(Error<Infallible, K::Rejection>) -> R + Clone,
@@ -663,6 +680,7 @@ where
     ///
     /// Returns a [`Stack`]-ed layer with the rate limiter layer and the error-handler layer combined
     /// that can be directly inserted into an [`axum::Router`].
+    #[must_use]
     pub fn default_handle_error(
         self,
     ) -> Stack<
@@ -686,7 +704,7 @@ pub mod extensions {
     #[derive(Clone)]
     pub struct RateLimiter<T: Hash + Eq = ()> {
         pub(crate) key: RouteWithKey<T>,
-        pub(crate) limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, ahash::RandomState>>,
+        pub(crate) limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, RandomState>>,
     }
 
     impl<T: Hash + Eq> RateLimiter<T> {

@@ -244,6 +244,7 @@ impl IntoResponse for RateLimitError {
 impl RateLimitError {
     /// Returns the amount of time until the next request can be made as a `Duration`.
     #[inline]
+    #[must_use]
     pub const fn as_duration(self) -> Duration {
         Duration::from_nanos(self.0.get())
     }
@@ -276,7 +277,7 @@ impl Quota {
     ///
     /// Burst requests ignore the individual emission interval in favor of
     /// delivering all at once or in quick succession, up until the provided limit.
-    #[rustfmt::skip]
+    #[rustfmt::skip] #[must_use]
     pub const fn new(emission_interval: Duration, burst: NonZeroU64) -> Quota {
         let t = emission_interval.as_nanos() as u64;
         Quota { t, tau: t * burst.get() }
@@ -285,6 +286,7 @@ impl Quota {
     /// Constructs a new quota with the given emission interval, but with a burst size of 1.
     ///
     /// See [`Quota::new`] for more information.
+    #[must_use]
     pub const fn simple(emission_interval: Duration) -> Quota {
         Self::new(emission_interval, NonZeroU64::MIN)
     }
@@ -302,6 +304,7 @@ impl Gcra {
     ///
     /// This is equivalent to `Gcra(now + t).req()`, but more efficient.
     #[inline]
+    #[must_use]
     pub const fn first(Quota { t, .. }: Quota, now: u64) -> Gcra {
         // Equivalent to `Gcra(now + t).req()` to calculate the first request
         Gcra(AtomicU64::new(now + t + t))
