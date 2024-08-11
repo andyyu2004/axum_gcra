@@ -54,7 +54,7 @@ use axum_gcra::{RateLimitLayer, real_ip::RealIp, extensions::RateLimiter};
 type Key = RealIp; // could also be `(RealIp, UserSession)`, for example.
 
 let app = Router::<()>::new()
-    // keys are any type that can implement `FromRequestParts` and `axum_gcra::Key`, so this works.
+    // keys are any type that can implement `FromRequestParts` and `axum_gcra::Key`
     .route("/", get(|ip: RealIp| async move { format!("Hello, {ip}!") }))
     // The key type must also be specified when extracting the `RateLimiter` extension.
     .route("/extension", get(|rl: Extension<RateLimiter<Key>>| async move {
@@ -64,7 +64,7 @@ let app = Router::<()>::new()
     .route_layer(RateLimitLayer::<Key>::builder().default_handle_error());
 ```
 
-Please read the documentation for `RealIp` for more information.
+Please read the documentation for [`RealIp`] for more information.
 
 # Garbage Collection
 
@@ -88,4 +88,4 @@ let app = Router::<()>::new()
     );
 ```
 
-See the docs for `GcInterval` for more information.
+See the docs for [`GCInterval`] for more information.

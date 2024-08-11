@@ -37,6 +37,9 @@ use tower::{Layer, Service};
 /// [`Router::into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info),
 /// it will also try to get the IP address from the underlying socket via the [`ConnectInfo<SocketAddr>`](axum::extract::ConnectInfo) extension.
 /// This is optional as it may not work as expected if the server is behind a reverse proxy.
+///
+/// The [`RealIpLayer`] can be also used to add the [`RealIp`] extension to the request if available, allowing
+/// other services or extractors to reuse it without rescanning the headers every time.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct RealIp(pub IpAddr);

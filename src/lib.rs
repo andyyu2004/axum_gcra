@@ -25,6 +25,9 @@ use tower::{Layer, Service};
 #[cfg(feature = "real_ip")]
 pub mod real_ip;
 
+#[cfg(all(doc, feature = "real_ip"))]
+use real_ip::RealIp; // needed for the doc link in the README
+
 /// Trait for user-provided keys used to identify rate limiter entries.
 ///
 /// Keys should be uniquely identifiable to avoid rate limiting other users,
