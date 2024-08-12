@@ -44,7 +44,7 @@ use real_ip::RealIp; // needed for the doc link in the README
 /// within the rate limiter layer/service.
 pub trait Key: Hash + Eq + Send + Sync + 'static {}
 
-impl<T> Key for T where T: Hash + Eq + Send + Sync + 'static {}
+impl<K> Key for K where K: Hash + Eq + Send + Sync + 'static {}
 
 pub mod gcra;
 pub use gcra::RateLimitError;
@@ -161,6 +161,16 @@ struct RouteWithKey<T> {
     key: T,
 }
 
+impl<T> RouteWithKey<T> {
+    #[inline]
+    fn as_route(&self) -> Route {
+        Route {
+            path: Cow::Borrowed(&*self.path),
+            method: Cow::Borrowed(&self.method),
+        }
+    }
+}
+
 /// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router) to a [`gcra::Quota`].
 type Quotas = HashMap<Route<'static>, gcra::Quota, RandomState>;
 
@@ -251,30 +261,20 @@ pub struct RateLimitLayer<K: Key = ()> {
 ///
 /// Used to insert the rate limiter into the request's extensions,
 /// without knowing the type of the key except when the handler is defined and not further.
-trait SetExtension<T: Hash + Eq>: Send + Sync + 'static {
-    fn set_extension(
-        &self,
-        req: &mut Extensions,
-        key: &RouteWithKey<T>,
-        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, RandomState>>,
-    );
+trait SetExtension<K: Key>: Send + Sync + 'static {
+    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K>);
 }
 
 struct DoSetExtension;
 
-impl<T: Hash + Eq> SetExtension<T> for DoSetExtension
+impl<K: Key> SetExtension<K> for DoSetExtension
 where
-    T: Clone + Send + Sync + 'static,
+    K: Clone,
 {
-    fn set_extension(
-        &self,
-        req: &mut Extensions,
-        key: &RouteWithKey<T>,
-        limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, RandomState>>,
-    ) {
+    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K>) {
         req.insert(extensions::RateLimiter {
             key: key.clone(),
-            limiter,
+            layer,
         });
     }
 }
@@ -501,12 +501,7 @@ impl<K: Key> RateLimitLayer<K> {
     where
         F: FnOnce(&RouteWithKey<K>),
     {
-        let quota_key = Route {
-            path: Cow::Borrowed(&*key.path),
-            method: Cow::Borrowed(&key.method),
-        };
-
-        let quota = match self.builder.quotas.get(&quota_key).copied() {
+        let quota = match self.builder.quotas.get(&key.as_route()).copied() {
             Some(quota) => quota,
             None => {
                 if self.builder.global_fallback {
@@ -570,7 +565,7 @@ where
                 let res = layer.req_peek_key(key, now, |key| {
                     if let Some(ref set_ext) = layer.builder.set_ext {
                         // set_extension will clone the key internally
-                        set_ext.set_extension(&mut parts.extensions, key, layer.limiter.clone());
+                        set_ext.set_extension(&mut parts.extensions, key, layer.clone());
                     }
                 });
 
@@ -702,15 +697,15 @@ pub mod extensions {
     /// [`Request`] extension to access the internal rate limiter used during that request,
     /// such as to apply a penalty or reset the rate limit.
     #[derive(Clone)]
-    pub struct RateLimiter<T: Hash + Eq = ()> {
-        pub(crate) key: RouteWithKey<T>,
-        pub(crate) limiter: Arc<gcra::RateLimiter<RouteWithKey<T>, RandomState>>,
+    pub struct RateLimiter<K: Key = ()> {
+        pub(crate) key: RouteWithKey<K>,
+        pub(crate) layer: RateLimitLayer<K>,
     }
 
-    impl<T: Hash + Eq> RateLimiter<T> {
+    impl<K: Key> RateLimiter<K> {
         /// Get the key used to identify the rate limiter entry.
         #[inline(always)]
-        pub fn key(&self) -> &T {
+        pub fn key(&self) -> &K {
             &self.key.key
         }
 
@@ -724,34 +719,39 @@ pub mod extensions {
             &self.key.method
         }
 
+        /// Get the quota for the route that was rate limited.
+        pub fn quota(&self) -> gcra::Quota {
+            self.layer.builder.quotas.get(&self.key.as_route()).copied().expect("no quota found for route")
+        }
+
         /// See [`gcra::RateLimiter::penalize`] for more information.
         pub async fn penalize(&self, penalty: Duration) -> bool {
-            self.limiter.penalize(&self.key, penalty).await
+            self.layer.limiter.penalize(&self.key, penalty).await
         }
 
         /// See [`gcra::RateLimiter::penalize_sync`] for more information.
         pub fn penalize_sync(&self, penalty: Duration) -> bool {
-            self.limiter.penalize_sync(&self.key, penalty)
+            self.layer.limiter.penalize_sync(&self.key, penalty)
         }
 
         /// See [`gcra::RateLimiter::reset`] for more information.
         pub async fn reset(&self) -> bool {
-            self.limiter.reset(&self.key).await
+            self.layer.limiter.reset(&self.key).await
         }
 
         /// See [`gcra::RateLimiter::reset_sync`] for more information.
         pub fn reset_sync(&self) -> bool {
-            self.limiter.reset_sync(&self.key)
+            self.layer.limiter.reset_sync(&self.key)
         }
 
         /// See [`gcra::RateLimiter::clean`] for more information.
         pub async fn clean(&self, before: Instant) {
-            self.limiter.clean(before).await;
+            self.layer.limiter.clean(before).await;
         }
 
         /// See [`gcra::RateLimiter::clean_sync`] for more information.
         pub fn clean_sync(&self, before: Instant) {
-            self.limiter.clean_sync(before);
+            self.layer.limiter.clean_sync(before);
         }
     }
 }
