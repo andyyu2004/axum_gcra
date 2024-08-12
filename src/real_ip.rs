@@ -17,17 +17,19 @@ use axum::{extract::FromRequestParts, response::IntoResponse};
 use http::{header::HeaderName, request::Parts, HeaderValue, Request, StatusCode};
 use tower::{Layer, Service};
 
-/// Wrapper around `std::net::IpAddr` that can be extracted from the request parts.
+/// Wrapper around [`std::net::IpAddr`] that can be extracted from the request parts.
 ///
 /// This extractor will try to get the real IP address of the client, using the following headers, in order:
-/// - `x-forwarded-for`
+/// - `cf-connecting-ip` (used by Cloudflare sometimes)
+/// - `x-cluster-client-ip` (used by AWS sometimes)
+/// - `fly-client-ip` (used by Fly.io sometimes)
+/// - `fastly-client-ip` (used by Fastly sometimes)
+/// - `cloudfront-viewer-address" (used by Cloudfront sometimes)
 /// - `x-real-ip`
+/// - `x-forwarded-for`
+/// - `x-original-forwarded-for` (maybe used by Cloudfront?)
 /// - `true-client-ip` (used by some load balancers)
 /// - `client-ip` (used by some load balancers)
-/// - `x-cluster-client-ip` (used by AWS sometimes)
-/// - `cf-connecting-ip` (used by Cloudflare sometimes)
-/// - `fly-client-ip` (used by Fly.io sometimes)
-/// - `cloudfront-viewer-address` (used by Cloudfront sometimes)
 ///
 /// If none of these headers are found, it will return a 400 Bad Request via [`IpAddrRejection`],
 /// or the error can be handled with a custom rejection handler with
@@ -144,15 +146,17 @@ fn get_ip_from_parts(parts: &Parts) -> Option<IpAddr> {
             .and_then(|s| IpAddr::from_str(s.trim()).ok())
     }
 
-    static HEADERS: [HeaderName; 8] = [
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderName::from_static("x-real-ip"),
-        HeaderName::from_static("true-client-ip"), // used by some load balancers
-        HeaderName::from_static("client-ip"),      // used by some load balancers
-        HeaderName::from_static("x-cluster-client-ip"), // used by AWS sometimes
+    static HEADERS: [HeaderName; 10] = [
         HeaderName::from_static("cf-connecting-ip"), // used by Cloudflare sometimes
-        HeaderName::from_static("fly-client-ip"),  // used by Fly.io sometimes
+        HeaderName::from_static("x-cluster-client-ip"), // used by AWS sometimes
+        HeaderName::from_static("fly-client-ip"),    // used by Fly.io sometimes
+        HeaderName::from_static("fastly-client-ip"), // used by Fastly sometimes
         HeaderName::from_static("cloudfront-viewer-address"), // used by Cloudfront sometimes
+        HeaderName::from_static("x-real-ip"),
+        HeaderName::from_static("x-forwarded-for"),
+        HeaderName::from_static("x-original-forwarded-for"), // maybe used by Cloudfront?
+        HeaderName::from_static("true-client-ip"),           // used by some load balancers
+        HeaderName::from_static("client-ip"),                // used by some load balancers
     ];
 
     for header in &HEADERS {
