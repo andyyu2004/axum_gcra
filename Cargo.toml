@@ -12,11 +12,12 @@ keywords = ["axum", "rate-limiting", "middleware", "gcra"]
 categories = ["web-programming"]
 
 [features]
-default = ["tokio", "real_ip", "ahash"]
+default = ["tokio", "real_ip", "ahash", "itoa"]
 
 ahash = ["dep:ahash"]
 tokio = ["dep:tokio", "axum/tokio"]
 real_ip = ["tokio", "dep:async-trait"]
+itoa = ["dep:itoa"]
 
 [dependencies]
 tower = "0.4"
@@ -29,6 +30,7 @@ pin-project-lite = "0.2.14"
 ahash = { version = "0.8.11", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"], optional = true }
 async-trait = { version = "0.1.81", optional = true }
+itoa = { version = "1.0.11", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.7", default-features = true }
