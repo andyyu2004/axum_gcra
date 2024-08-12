@@ -225,7 +225,7 @@ impl fmt::Display for RateLimitError {
         write!(
             f,
             "rate limit exceeded, retry in {:.3} seconds",
-            self.as_duration().as_secs_f64()
+            self.as_duration().as_secs_f32()
         )
     }
 }
@@ -237,7 +237,49 @@ use axum::response::{IntoResponse, Response};
 
 impl IntoResponse for RateLimitError {
     fn into_response(self) -> Response {
-        (StatusCode::TOO_MANY_REQUESTS, self.to_string()).into_response()
+        use http::{HeaderName, HeaderValue};
+
+        // reuse as_duration value
+        let reset = self.as_duration();
+
+        let mut res = Response::new(From::from(format!(
+            "rate limit exceeded, retry in {:.3} seconds",
+            reset.as_secs_f32()
+        )));
+
+        *res.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+
+        let reset = reset.as_secs().max(1);
+
+        // optimize for common values
+        let value = match reset {
+            1 => HeaderValue::from_static("1"),
+            2 => HeaderValue::from_static("2"),
+            _ => {
+                #[cfg(feature = "itoa")]
+                let value = {
+                    let mut buffer = itoa::Buffer::new();
+                    HeaderValue::from_str(buffer.format(reset)).unwrap()
+                };
+
+                #[cfg(not(feature = "itoa"))]
+                let value = HeaderValue::from_str(&reset.to_string()).unwrap();
+
+                value
+            }
+        };
+
+        let headers = res.headers_mut();
+
+        headers.insert(HeaderName::from_static("ratelimit-reset"), value.clone());
+        headers.insert(HeaderName::from_static("x-ratelimit-reset"), value.clone());
+        headers.insert(HeaderName::from_static("retry-after"), value.clone());
+        headers.insert(
+            HeaderName::from_static("ratelimit-remaining"),
+            HeaderValue::from_static("0"),
+        );
+
+        res
     }
 }
 
