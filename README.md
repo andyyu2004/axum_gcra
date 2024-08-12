@@ -64,6 +64,12 @@ let app = Router::<()>::new()
     .route_layer(RateLimitLayer::<Key>::builder().default_handle_error());
 ```
 
+It's notable that `RealIp` will only be able to extract the client IP address from the underlying socket
+if used with [`Router::into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info),
+otherwise it must only rely on the request headers. However, the socket address may not always be the client's
+real IP address, especially if the server is behind a reverse proxy, so be sure to configure the reverse proxy
+to forward the client's IP address in the `X-Forwarded-For` header, or one of the others that `RealIp` can extract.
+
 Please read the documentation for [`RealIp`] for more information.
 
 # Garbage Collection
@@ -89,3 +95,12 @@ let app = Router::<()>::new()
 ```
 
 See the docs for [`GCInterval`] for more information.
+
+# Cargo Feature Flags
+
+The follow features are enabled by default but can be disabled if not needed:
+
+- `ahash`: Use the [`ahash`] crate for faster hashing of keys.
+- `tokio`: Use the [`tokio`] crate for time-based GC intervals and specific socket utilities.
+- `real_ip`: Enable the [`RealIp`] extractor, also enables the `tokio` feature.
+- `itoa`: Use the [`itoa`] crate for integer to string conversion.
