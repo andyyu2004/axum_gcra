@@ -3,6 +3,7 @@
 #![warn(clippy::perf, clippy::style)]
 
 use std::{
+    any::TypeId,
     borrow::Cow,
     collections::HashMap,
     convert::Infallible,
@@ -516,6 +517,35 @@ impl<K: Key> RateLimitLayer<K> {
     }
 }
 
+async fn get_user_key<K>(parts: &mut Parts) -> Result<K, K::Rejection>
+where
+    K: Key + FromRequestParts<()>,
+{
+    // poor man's specialization
+    match TypeId::of::<K>() {
+        ty if ty == TypeId::of::<()>() => {
+            return unsafe { std::mem::transmute_copy(&()) };
+        }
+
+        #[cfg(feature = "real_ip")]
+        ty if ty == TypeId::of::<real_ip::RealIp>() => {
+            #[rustfmt::skip]
+            let ip = parts.extensions.get::<real_ip::RealIp>().copied()
+                .or_else(|| real_ip::get_ip_from_parts(parts));
+
+            if let Some(ip) = ip {
+                return unsafe { std::mem::transmute_copy(&ip) };
+            }
+        }
+        _ => {}
+    }
+
+    match K::from_request_parts(parts, &()).await {
+        Ok(key) => Ok(key),
+        Err(rejection) => Err(rejection),
+    }
+}
+
 impl<I, K, B> Service<Request<B>> for RateLimitService<I, K>
 where
     I: Service<Request<B>, Future: TryFuture<Ok = I::Response, Error = I::Error>> + Clone + Send + 'static,
@@ -551,13 +581,8 @@ where
             body: Some(body), // once told me
 
             f: Box::pin(async move {
-                let user_key = match K::from_request_parts(&mut parts, &()).await {
-                    Ok(key) => key,
-                    Err(rejection) => return Err(Error::KeyRejection(rejection)),
-                };
-
                 let key = RouteWithKey {
-                    key: user_key,
+                    key: get_user_key(&mut parts).await.map_err(Error::KeyRejection)?,
                     path,
                     method: parts.method.clone(),
                 };

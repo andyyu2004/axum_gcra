@@ -89,7 +89,7 @@ impl<S> FromRequestParts<S> for RealIp {
         }
 
         match get_ip_from_parts(parts) {
-            Some(ip) => Ok(RealIp(ip)),
+            Some(ip) => Ok(ip),
             None => Err(IpAddrRejection),
         }
     }
@@ -123,7 +123,7 @@ where
         let (mut parts, body) = req.into_parts();
 
         if let Some(ip) = get_ip_from_parts(&parts) {
-            parts.extensions.insert(RealIp(ip));
+            parts.extensions.insert(ip);
         }
 
         self.0.call(Request::from_parts(parts, body))
@@ -138,7 +138,7 @@ impl<I> Layer<I> for RealIpLayer {
     }
 }
 
-fn get_ip_from_parts(parts: &Parts) -> Option<IpAddr> {
+pub(crate) fn get_ip_from_parts(parts: &Parts) -> Option<RealIp> {
     fn parse_ip(s: &HeaderValue) -> Option<IpAddr> {
         s.to_str()
             .ok()
@@ -161,13 +161,13 @@ fn get_ip_from_parts(parts: &Parts) -> Option<IpAddr> {
 
     for header in &HEADERS {
         if let Some(real_ip) = parts.headers.get(header).and_then(parse_ip) {
-            return Some(real_ip);
+            return Some(RealIp(real_ip));
         }
     }
 
     #[cfg(feature = "tokio")]
     if let Some(info) = parts.extensions.get::<axum::extract::ConnectInfo<SocketAddr>>() {
-        return Some(info.ip());
+        return Some(RealIp(info.ip()));
     }
 
     None
