@@ -524,19 +524,33 @@ where
     // poor man's specialization
     match TypeId::of::<K>() {
         ty if ty == TypeId::of::<()>() => {
-            return unsafe { std::mem::transmute_copy(&()) };
+            return Ok(unsafe { std::mem::transmute_copy::<_, K>(&()) });
         }
 
         #[cfg(feature = "real_ip")]
-        ty if ty == TypeId::of::<real_ip::RealIp>() => {
+        ty if ty == TypeId::of::<real_ip::RealIp>() || ty == TypeId::of::<(real_ip::RealIp,)>() => {
             #[rustfmt::skip]
             let ip = parts.extensions.get::<real_ip::RealIp>().copied()
                 .or_else(|| real_ip::get_ip_from_parts(parts));
 
             if let Some(ip) = ip {
-                return unsafe { std::mem::transmute_copy(&ip) };
+                return Ok(unsafe { std::mem::transmute_copy::<_, K>(&ip) });
             }
         }
+
+        #[cfg(feature = "real_ip")]
+        ty if ty == TypeId::of::<real_ip::RealIpPrivacyMask>()
+            || ty == TypeId::of::<(real_ip::RealIpPrivacyMask,)>() =>
+        {
+            #[rustfmt::skip]
+            let ip = parts.extensions.get::<real_ip::RealIp>().copied()
+                .or_else(|| real_ip::get_ip_from_parts(parts));
+
+            if let Some(ip) = ip {
+                return Ok(unsafe { std::mem::transmute_copy::<_, K>(&real_ip::RealIpPrivacyMask::from(ip)) });
+            }
+        }
+
         _ => {}
     }
 
