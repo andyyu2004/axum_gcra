@@ -4,13 +4,13 @@ use axum::{
     extract::Extension,
     routing::{get, post, Router},
 };
-use axum_gcra::{extensions::RateLimiter, gcra::Quota, real_ip::RealIp, RateLimitLayer};
+use axum_gcra::{extensions::RateLimiter, gcra::Quota, real_ip::RealIpPrivacyMask, RateLimitLayer};
 use http::Method;
 
 #[tokio::main]
 async fn main() {
     type Hash = rustc_hash::FxBuildHasher;
-    type Key = (RealIp,); // note there can be multiple keys, but for this example we only use the IP address
+    type Key = (RealIpPrivacyMask,); // note there can be multiple keys, but for this example we only use the IP address
 
     #[rustfmt::skip]
     let app = Router::new()

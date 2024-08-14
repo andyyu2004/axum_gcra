@@ -523,37 +523,42 @@ async fn get_user_key<K>(parts: &mut Parts) -> Result<K, K::Rejection>
 where
     K: Key + FromRequestParts<()>,
 {
+    use core::mem::{size_of, transmute_copy};
+
+    #[inline(always)]
+    fn same_ty<A: 'static, B: 'static>() -> bool {
+        let b = TypeId::of::<B>();
+
+        // check same type or 1-tuple of the same layout
+        TypeId::of::<A>() == b || (TypeId::of::<(A,)>() == b && size_of::<A>() == size_of::<B>())
+    }
+
     // poor man's specialization
-    match TypeId::of::<K>() {
-        ty if ty == TypeId::of::<()>() => {
-            return Ok(unsafe { std::mem::transmute_copy::<_, K>(&()) });
+
+    if same_ty::<K, ()>() {
+        return Ok(unsafe { transmute_copy::<_, K>(&()) });
+    }
+
+    #[cfg(feature = "real_ip")]
+    if same_ty::<K, real_ip::RealIp>() {
+        #[rustfmt::skip]
+        let ip = parts.extensions.get::<real_ip::RealIp>().copied()
+            .or_else(|| real_ip::get_ip_from_parts(parts));
+
+        if let Some(ip) = ip {
+            return Ok(unsafe { transmute_copy::<_, K>(&ip) });
         }
+    }
 
-        #[cfg(feature = "real_ip")]
-        ty if ty == TypeId::of::<real_ip::RealIp>() || ty == TypeId::of::<(real_ip::RealIp,)>() => {
-            #[rustfmt::skip]
-            let ip = parts.extensions.get::<real_ip::RealIp>().copied()
-                .or_else(|| real_ip::get_ip_from_parts(parts));
+    #[cfg(feature = "real_ip")]
+    if same_ty::<K, real_ip::RealIpPrivacyMask>() {
+        #[rustfmt::skip]
+        let ip = parts.extensions.get::<real_ip::RealIp>().copied()
+            .or_else(|| real_ip::get_ip_from_parts(parts));
 
-            if let Some(ip) = ip {
-                return Ok(unsafe { std::mem::transmute_copy::<_, K>(&ip) });
-            }
+        if let Some(ip) = ip {
+            return Ok(unsafe { transmute_copy::<_, K>(&real_ip::RealIpPrivacyMask::from(ip)) });
         }
-
-        #[cfg(feature = "real_ip")]
-        ty if ty == TypeId::of::<real_ip::RealIpPrivacyMask>()
-            || ty == TypeId::of::<(real_ip::RealIpPrivacyMask,)>() =>
-        {
-            #[rustfmt::skip]
-            let ip = parts.extensions.get::<real_ip::RealIp>().copied()
-                .or_else(|| real_ip::get_ip_from_parts(parts));
-
-            if let Some(ip) = ip {
-                return Ok(unsafe { std::mem::transmute_copy::<_, K>(&real_ip::RealIpPrivacyMask::from(ip)) });
-            }
-        }
-
-        _ => {}
     }
 
     match K::from_request_parts(parts, &()).await {
