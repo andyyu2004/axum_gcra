@@ -46,6 +46,27 @@ use tower::{Layer, Service};
 #[repr(transparent)]
 pub struct RealIp(pub IpAddr);
 
+/// Like [`RealIp`], but with the last 64 bits of any IPv6 address set to zeroes.
+///
+/// This is useful for making sure clients with randomized IPv6 interfaces
+/// aren't treated as different clients. This can be common in some networks
+/// that attempt to preserve privacy.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct RealIpPrivacyMask(pub RealIp);
+
+impl From<RealIp> for RealIpPrivacyMask {
+    #[inline]
+    fn from(ip: RealIp) -> Self {
+        RealIpPrivacyMask(match ip.0 {
+            IpAddr::V4(ip) => RealIp(IpAddr::V4(ip)),
+            IpAddr::V6(ip) => RealIp(IpAddr::V6(From::from(
+                ip.to_bits() & 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000,
+            ))),
+        })
+    }
+}
+
 impl Debug for RealIp {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -60,8 +81,31 @@ impl Display for RealIp {
     }
 }
 
+impl Debug for RealIpPrivacyMask {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
+
+impl Display for RealIpPrivacyMask {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
 impl Deref for RealIp {
     type Target = IpAddr;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Deref for RealIpPrivacyMask {
+    type Target = RealIp;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -90,6 +134,22 @@ impl<S> FromRequestParts<S> for RealIp {
 
         match get_ip_from_parts(parts) {
             Some(ip) => Ok(ip),
+            None => Err(IpAddrRejection),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> FromRequestParts<S> for RealIpPrivacyMask {
+    type Rejection = IpAddrRejection;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        if let Some(&ip) = parts.extensions.get::<RealIp>() {
+            return Ok(ip.into());
+        }
+
+        match get_ip_from_parts(parts) {
+            Some(ip) => Ok(ip.into()),
             None => Err(IpAddrRejection),
         }
     }
