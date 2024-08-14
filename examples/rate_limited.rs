@@ -9,26 +9,27 @@ use http::Method;
 
 #[tokio::main]
 async fn main() {
+    type Hash = rustc_hash::FxBuildHasher;
     type Key = (RealIp,); // note there can be multiple keys, but for this example we only use the IP address
 
     #[rustfmt::skip]
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
         .route("/build", get(|| async { "Build info" }))
-        .route("/penalize", get(|rl: Extension<RateLimiter<Key>>| async move {
+        .route("/penalize", get(|rl: Extension<RateLimiter<Key, Hash>>| async move {
             println!("{:?}", rl.key());
 
             rl.penalize(Duration::from_secs(50)).await;
 
             "You came to the wrong neighborhood"
         }))
-        .route("/reset", post(|rl: Extension<RateLimiter<Key>>| async move {
+        .route("/reset", post(|rl: Extension<RateLimiter<Key, Hash>>| async move {
             rl.reset().await;
         }))
         .route_layer(
             // the key is a tuple of the client's IP address and a constant value
             // `Extract` is a helper type that allows using stateless key extractors
-            RateLimitLayer::<Key>::builder()
+            RateLimitLayer::<Key, Hash>::builder()
             .with_default_quota(Quota::simple(Duration::from_secs(5)))
             // these could be simplified using a macro to insert the quota values using `add_quota` alongside the routes above
             .with_route((Method::GET, "/build"), Quota::simple(Duration::from_secs(2)))

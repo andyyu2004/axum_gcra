@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::{Future, Ready},
-    hash::Hash,
+    hash::{BuildHasher, Hash},
     ops::Deref,
     pin::Pin,
     sync::Arc,
@@ -216,9 +216,9 @@ impl Hash for MatchedPath {
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
 ///
 /// Note: The limiter is shared across all clones of the layer and service.
-pub struct RateLimitService<I, K: Key = ()> {
+pub struct RateLimitService<I, K: Key = (), H: BuildHasher = RandomState> {
     inner: I,
-    layer: RateLimitLayer<K>,
+    layer: RateLimitLayer<K, H>,
 }
 
 #[cfg(feature = "tokio")]
@@ -230,10 +230,10 @@ struct BuilderDropNotify {
 /// Builder for the rate limiter layer.
 ///
 /// This struct is used to configure the rate limiter before building it.
-pub struct RateLimitLayerBuilder<K = ()> {
+pub struct RateLimitLayerBuilder<K = (), H: BuildHasher = RandomState> {
     quotas: Quotas,
     default_quota: gcra::Quota,
-    set_ext: Option<Box<dyn SetExtension<K>>>,
+    set_ext: Option<Box<dyn SetExtension<K, H>>>,
     global_fallback: bool,
     gc_interval: GCInterval,
 
@@ -241,7 +241,7 @@ pub struct RateLimitLayerBuilder<K = ()> {
     shutdown: BuilderDropNotify,
 }
 
-impl<K> Drop for RateLimitLayerBuilder<K> {
+impl<K, H: BuildHasher> Drop for RateLimitLayerBuilder<K, H> {
     fn drop(&mut self) {
         #[cfg(feature = "tokio")]
         self.shutdown.notify.notify_waiters();
@@ -253,34 +253,35 @@ impl<K> Drop for RateLimitLayerBuilder<K> {
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
 ///
 /// Note: The limiter is shared across all clones of the layer and service.
-pub struct RateLimitLayer<K: Key = ()> {
-    builder: Arc<RateLimitLayerBuilder<K>>,
-    limiter: Arc<gcra::RateLimiter<RouteWithKey<K>, RandomState>>,
+pub struct RateLimitLayer<K: Key = (), H: BuildHasher = RandomState> {
+    builder: Arc<RateLimitLayerBuilder<K, H>>,
+    limiter: Arc<gcra::RateLimiter<RouteWithKey<K>, H>>,
 }
 
 /// Object-safe trait for setting an extension on a request.
 ///
 /// Used to insert the rate limiter into the request's extensions,
 /// without knowing the type of the key except when the handler is defined and not further.
-trait SetExtension<K: Key>: Send + Sync + 'static {
-    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K>);
+trait SetExtension<K: Key, H: BuildHasher>: Send + Sync + 'static {
+    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K, H>);
 }
 
 struct DoSetExtension;
 
-impl<K: Key> SetExtension<K> for DoSetExtension
+impl<K: Key, H: BuildHasher> SetExtension<K, H> for DoSetExtension
 where
     K: Clone,
+    H: Send + Sync + 'static,
 {
-    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K>) {
-        req.insert(extensions::RateLimiter {
+    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K, H>) {
+        req.insert(extensions::RateLimiter::<K, H> {
             key: key.clone(),
             layer,
         });
     }
 }
 
-impl<K: Key> Clone for RateLimitLayer<K> {
+impl<K: Key, H: BuildHasher> Clone for RateLimitLayer<K, H> {
     fn clone(&self) -> Self {
         Self {
             limiter: self.limiter.clone(),
@@ -289,7 +290,7 @@ impl<K: Key> Clone for RateLimitLayer<K> {
     }
 }
 
-impl<I: Clone, K: Key> Clone for RateLimitService<I, K> {
+impl<I: Clone, K: Key, H: BuildHasher> Clone for RateLimitService<I, K, H> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -298,15 +299,15 @@ impl<I: Clone, K: Key> Clone for RateLimitService<I, K> {
     }
 }
 
-impl<K: Key> RateLimitLayer<K> {
+impl<K: Key, H: BuildHasher> RateLimitLayer<K, H> {
     /// Begin building a new rate limiter layer starting with the default configuration.
     #[must_use]
-    pub fn builder() -> RateLimitLayerBuilder<K> {
+    pub fn builder() -> RateLimitLayerBuilder<K, H> {
         RateLimitLayerBuilder::new()
     }
 }
 
-impl<K: Key> RateLimitLayerBuilder<K> {
+impl<K: Key, H: BuildHasher> RateLimitLayerBuilder<K, H> {
     #[must_use]
     pub fn new() -> Self {
         RateLimitLayerBuilder {
@@ -401,9 +402,10 @@ impl<K: Key> RateLimitLayerBuilder<K> {
     pub fn with_extension(mut self, extend: bool) -> Self
     where
         K: Clone,
+        H: Send + Sync + 'static,
     {
         self.set_ext = match extend {
-            true => Some(Box::new(DoSetExtension)),
+            true => Some(Box::new(DoSetExtension) as Box<dyn SetExtension<K, H>>),
             false => None,
         };
         self
@@ -412,7 +414,7 @@ impl<K: Key> RateLimitLayerBuilder<K> {
 
 impl Default for RateLimitLayerBuilder<()> {
     fn default() -> Self {
-        RateLimitLayer::builder()
+        RateLimitLayerBuilder::new()
     }
 }
 
@@ -492,7 +494,7 @@ where
     }
 }
 
-impl<K: Key> RateLimitLayer<K> {
+impl<K: Key, H: BuildHasher> RateLimitLayer<K, H> {
     async fn req_peek_key<F>(
         &self,
         mut key: RouteWithKey<K>,
@@ -560,10 +562,11 @@ where
     }
 }
 
-impl<I, K, B> Service<Request<B>> for RateLimitService<I, K>
+impl<I, K, B, H> Service<Request<B>> for RateLimitService<I, K, H>
 where
     I: Service<Request<B>, Future: TryFuture<Ok = I::Response, Error = I::Error>> + Clone + Send + 'static,
     K: Key + FromRequestParts<()>,
+    H: BuildHasher + Send + Sync + 'static,
 {
     type Response = I::Response;
     type Error = Error<I::Error, K::Rejection>;
@@ -617,11 +620,12 @@ where
     }
 }
 
-impl<K, I> Layer<I> for RateLimitLayer<K>
+impl<K, I, H> Layer<I> for RateLimitLayer<K, H>
 where
     K: Key,
+    H: BuildHasher,
 {
-    type Service = RateLimitService<I, K>;
+    type Service = RateLimitService<I, K, H>;
 
     fn layer(&self, inner: I) -> Self::Service {
         RateLimitService {
@@ -633,9 +637,10 @@ where
 
 use tower::layer::util::Stack;
 
-impl<K> RateLimitLayerBuilder<K>
+impl<K, H: BuildHasher> RateLimitLayerBuilder<K, H>
 where
     K: Key + FromRequestParts<()>,
+    H: Default + Send + Sync + 'static,
 {
     /// Build the [`RateLimitLayer`].
     ///
@@ -648,11 +653,8 @@ where
     /// Use [`RateLimitLayerBuilder::handle_error`] or [`RateLimitLayerBuilder::default_handle_error`] to create a stack
     /// with the rate limiter layer and the error-handler layer combined.
     #[must_use]
-    pub fn build(self) -> RateLimitLayer<K> {
-        let limiter = Arc::new(gcra::RateLimiter::new(
-            self.gc_interval.to_requests(),
-            RandomState::default(),
-        ));
+    pub fn build(self) -> RateLimitLayer<K, H> {
+        let limiter = Arc::new(gcra::RateLimiter::new(self.gc_interval.to_requests(), H::default()));
 
         #[cfg(feature = "tokio")]
         if let GCInterval::Time(d) = self.gc_interval {
@@ -702,7 +704,7 @@ where
     ///    }));
     /// ```
     #[must_use]
-    pub fn handle_error<F, R>(self, cb: F) -> Stack<RateLimitLayer<K>, HandleErrorLayer<F, ()>>
+    pub fn handle_error<F, R>(self, cb: F) -> Stack<RateLimitLayer<K, H>, HandleErrorLayer<F, ()>>
     where
         F: Fn(Error<Infallible, K::Rejection>) -> R + Clone,
     {
@@ -718,7 +720,7 @@ where
     pub fn default_handle_error(
         self,
     ) -> Stack<
-        RateLimitLayer<K>,
+        RateLimitLayer<K, H>,
         HandleErrorLayer<impl Fn(Error<Infallible, K::Rejection>) -> Ready<Response> + Clone, ()>,
     >
     where
@@ -735,13 +737,27 @@ pub mod extensions {
 
     /// [`Request`] extension to access the internal rate limiter used during that request,
     /// such as to apply a penalty or reset the rate limit.
-    #[derive(Clone)]
-    pub struct RateLimiter<K: Key = ()> {
+    ///
+    /// Note that the `K: Key` and `H: BuildHasher` types must be the
+    /// exact same as those given to the [`RateLimitLayerBuilder`]/[`RateLimitLayer`].
+    pub struct RateLimiter<K: Key = (), H: BuildHasher = RandomState> {
         pub(crate) key: RouteWithKey<K>,
-        pub(crate) layer: RateLimitLayer<K>,
+        pub(crate) layer: RateLimitLayer<K, H>,
     }
 
-    impl<K: Key> RateLimiter<K> {
+    impl<K: Key, H: BuildHasher> Clone for RateLimiter<K, H>
+    where
+        K: Clone,
+    {
+        fn clone(&self) -> Self {
+            Self {
+                key: self.key.clone(),
+                layer: self.layer.clone(),
+            }
+        }
+    }
+
+    impl<K: Key, H: BuildHasher> RateLimiter<K, H> {
         /// Get the key used to identify the rate limiter entry.
         #[inline(always)]
         pub fn key(&self) -> &K {
