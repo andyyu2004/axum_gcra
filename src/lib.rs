@@ -5,11 +5,9 @@
 use std::{
     any::TypeId,
     borrow::Cow,
-    collections::HashMap,
     convert::Infallible,
     future::{Future, Ready},
     hash::{BuildHasher, Hash},
-    ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{ready, Context, Poll},
@@ -18,7 +16,7 @@ use std::{
 
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::{FromRequestParts, MatchedPath as AxumMatchedPath, Request},
+    extract::{FromRequestParts, Request},
     response::{IntoResponse, Response},
 };
 use http::{request::Parts, Extensions, Method};
@@ -43,7 +41,12 @@ use real_ip::RealIp; // needed for the doc link in the README
 ///
 /// Keys must also implement [`FromRequestParts`] to extract the key from the request
 /// within the rate limiter layer/service.
-pub trait Key: Hash + Eq + Send + Sync + 'static {}
+pub trait Key: Hash + Eq + Send + Sync + 'static {
+    /// The quota for the key, defaulting to the global default quota if not set.
+    fn quota(&self) -> Option<gcra::Quota> {
+        None
+    }
+}
 
 impl<K> Key for K where K: Hash + Eq + Send + Sync + 'static {}
 
@@ -126,95 +129,6 @@ where
     }
 }
 
-macro_rules! decl_route_methods {
-    ($($fn:ident => $method:ident),*) => {
-        impl<'a> Route<'a> {
-            /// Create a new route with the given method and path.
-            pub fn new(method: Method, path: impl Into<Cow<'a, str>>) -> Self {
-                Route {
-                    method: Cow::Owned(method),
-                    path: path.into(),
-                }
-            }
-
-            $(
-                #[doc = concat!("Create a new route with the [`", stringify!($method), "`](Method::", stringify!($method), ") method.")]
-                pub fn $fn(path: impl Into<Cow<'a, str>>) -> Route<'a> {
-                    Route::new(Method::$method, path)
-                }
-            )*
-        }
-    };
-}
-
-decl_route_methods! {
-    get     => GET,
-    post    => POST,
-    put     => PUT,
-    delete  => DELETE,
-    patch   => PATCH,
-    options => OPTIONS,
-    head    => HEAD,
-    trace   => TRACE,
-    connect => CONNECT
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct RouteWithKey<T> {
-    path: MatchedPath,
-    method: Method,
-    key: T,
-}
-
-impl<T> RouteWithKey<T> {
-    #[inline]
-    fn as_route(&self) -> Route {
-        Route {
-            path: Cow::Borrowed(&*self.path),
-            method: Cow::Borrowed(&self.method),
-        }
-    }
-}
-
-/// Hashmap of quotas for rate limiting, mapping a path as passed to [`Router`](axum::Router) to a [`gcra::Quota`].
-type Quotas = HashMap<Route<'static>, gcra::Quota, RandomState>;
-
-#[derive(Debug, Clone)]
-enum MatchedPath {
-    Fallback,
-    Axum(AxumMatchedPath),
-}
-
-impl Deref for MatchedPath {
-    type Target = str;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        match self {
-            MatchedPath::Fallback => "",
-            MatchedPath::Axum(path) => path.as_str(),
-        }
-    }
-}
-
-impl PartialEq for MatchedPath {
-    fn eq(&self, other: &Self) -> bool {
-        let a = &**self;
-        let b = &**other;
-
-        // compare Arc pointers first
-        a.as_ptr() == b.as_ptr() || a == b
-    }
-}
-
-impl Eq for MatchedPath {}
-
-impl Hash for MatchedPath {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (**self).hash(state);
-    }
-}
-
 /// Rate limiter [`Service`] for axum.
 ///
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
@@ -235,10 +149,8 @@ struct BuilderDropNotify {
 ///
 /// This struct is used to configure the rate limiter before building it.
 pub struct RateLimitLayerBuilder<K = (), S = (), H: BuildHasher = RandomState> {
-    quotas: Quotas,
     default_quota: gcra::Quota,
     set_ext: Option<Box<dyn SetExtension<K, S, H>>>,
-    global_fallback: bool,
     gc_interval: GCInterval,
     state: S,
 
@@ -260,7 +172,7 @@ impl<K, S, H: BuildHasher> Drop for RateLimitLayerBuilder<K, S, H> {
 /// Note: The limiter is shared across all clones of the layer and service.
 pub struct RateLimitLayer<K: Key = (), S = (), H: BuildHasher = RandomState> {
     builder: Arc<RateLimitLayerBuilder<K, S, H>>,
-    limiter: Arc<gcra::RateLimiter<RouteWithKey<K>, H>>,
+    limiter: Arc<gcra::RateLimiter<K, H>>,
 }
 
 /// Object-safe trait for setting an extension on a request.
@@ -268,7 +180,7 @@ pub struct RateLimitLayer<K: Key = (), S = (), H: BuildHasher = RandomState> {
 /// Used to insert the rate limiter into the request's extensions,
 /// without knowing the type of the key except when the handler is defined and not further.
 trait SetExtension<K: Key, S, H: BuildHasher>: Send + Sync + 'static {
-    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K, S, H>);
+    fn set_extension(&self, req: &mut Extensions, key: &K, layer: RateLimitLayer<K, S, H>);
 }
 
 struct DoSetExtension;
@@ -279,7 +191,7 @@ where
     S: State,
     H: Send + Sync + 'static,
 {
-    fn set_extension(&self, req: &mut Extensions, key: &RouteWithKey<K>, layer: RateLimitLayer<K, S, H>) {
+    fn set_extension(&self, req: &mut Extensions, key: &K, layer: RateLimitLayer<K, S, H>) {
         req.insert(extensions::RateLimiter::<K, S, H> {
             key: key.clone(),
             layer,
@@ -318,10 +230,8 @@ impl<K: Key, S: State, H: BuildHasher> RateLimitLayerBuilder<K, S, H> {
     pub fn new(state: S) -> Self {
         RateLimitLayerBuilder {
             state,
-            quotas: Default::default(),
             default_quota: Default::default(),
             set_ext: None,
-            global_fallback: false,
             gc_interval: GCInterval::default(),
 
             #[cfg(feature = "tokio")]
@@ -329,44 +239,10 @@ impl<K: Key, S: State, H: BuildHasher> RateLimitLayerBuilder<K, S, H> {
         }
     }
 
-    /// Insert a route entry into the quota table for the rate limiter.
-    pub fn add_route(&mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) {
-        self.add_routes(Some((route.into(), quota)));
-    }
-
-    /// Insert a route entry into the quota table for the rate limiter.
-    #[must_use]
-    pub fn with_route(mut self, route: impl Into<Route<'static>>, quota: gcra::Quota) -> Self {
-        self.add_route(route.into(), quota);
-        self
-    }
-
-    /// Insert many route entries into the quota table for the rate limiter.
-    pub fn add_routes(&mut self, quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>) {
-        self.quotas.extend(quotas.into_iter().map(|(route, quota)| (route.into(), quota)));
-    }
-
-    /// Insert many route entries into the quota table for the rate limiter.
-    #[must_use]
-    pub fn with_routes(
-        mut self,
-        quotas: impl IntoIterator<Item = (impl Into<Route<'static>>, gcra::Quota)>,
-    ) -> Self {
-        self.add_routes(quotas);
-        self
-    }
-
     /// Fallback quota for rate limiting if no specific quota is found for the path.
     #[must_use]
     pub fn with_default_quota(mut self, default_quota: gcra::Quota) -> Self {
         self.default_quota = default_quota;
-        self
-    }
-
-    /// Set whether to use a global fallback shared rate-limiter for all paths not explicitly defined.
-    #[must_use]
-    pub fn with_global_fallback(mut self, global_fallback: bool) -> Self {
-        self.global_fallback = global_fallback;
         self
     }
 
@@ -503,26 +379,11 @@ where
 }
 
 impl<K: Key, S: State, H: BuildHasher> RateLimitLayer<K, S, H> {
-    async fn req_peek_key<F>(
-        &self,
-        mut key: RouteWithKey<K>,
-        now: std::time::Instant,
-        peek: F,
-    ) -> Result<(), RateLimitError>
+    async fn req_peek_key<F>(&self, key: K, now: std::time::Instant, peek: F) -> Result<(), RateLimitError>
     where
-        F: FnOnce(&RouteWithKey<K>),
+        F: FnOnce(&K),
     {
-        let quota = match self.builder.quotas.get(&key.as_route()).copied() {
-            Some(quota) => quota,
-            None => {
-                if self.builder.global_fallback {
-                    key.path = MatchedPath::Fallback;
-                }
-
-                self.builder.default_quota
-            }
-        };
-
+        let quota = key.quota().unwrap_or(self.builder.default_quota);
         self.limiter.req_peek_key(key, quota, now, peek).await
     }
 }
@@ -598,11 +459,6 @@ where
         // try to get the current time as close as possible to the request
         let now = Instant::now();
 
-        let path = match req.extensions().get::<AxumMatchedPath>() {
-            Some(path) => MatchedPath::Axum(path.clone()),
-            None => MatchedPath::Fallback,
-        };
-
         let (mut parts, body) = req.into_parts();
 
         let layer = self.layer.clone();
@@ -612,11 +468,7 @@ where
             body: Some(body), // once told me
 
             f: Box::pin(async move {
-                let key = RouteWithKey {
-                    key: get_user_key(&mut parts, &layer.builder.state).await.map_err(Error::KeyRejection)?,
-                    path,
-                    method: parts.method.clone(),
-                };
+                let key = get_user_key(&mut parts, &layer.builder.state).await.map_err(Error::KeyRejection)?;
 
                 let res = layer.req_peek_key(key, now, |key| {
                     if let Some(ref set_ext) = layer.builder.set_ext {
@@ -756,7 +608,7 @@ pub mod extensions {
     /// Note that the `K: Key` and `H: BuildHasher` types must be the
     /// exact same as those given to the [`RateLimitLayerBuilder`]/[`RateLimitLayer`].
     pub struct RateLimiter<K: Key = (), S = (), H: BuildHasher = RandomState> {
-        pub(crate) key: RouteWithKey<K>,
+        pub(crate) key: K,
         pub(crate) layer: RateLimitLayer<K, S, H>,
     }
 
@@ -773,22 +625,7 @@ pub mod extensions {
         /// Get the key used to identify the rate limiter entry.
         #[inline(always)]
         pub fn key(&self) -> &K {
-            &self.key.key
-        }
-
-        /// Get the path of the route that was rate limited.
-        pub fn path(&self) -> &str {
-            &self.key.path
-        }
-
-        /// Get the method of the route that was rate limited.
-        pub fn method(&self) -> &Method {
-            &self.key.method
-        }
-
-        /// Get the quota for the route that was rate limited.
-        pub fn quota(&self) -> gcra::Quota {
-            self.layer.builder.quotas.get(&self.key.as_route()).copied().expect("no quota found for route")
+            &self.key
         }
 
         /// See [`gcra::RateLimiter::penalize`] for more information.

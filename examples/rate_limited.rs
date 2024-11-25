@@ -5,7 +5,6 @@ use axum::{
     routing::{get, post, Router},
 };
 use axum_gcra::{extensions::RateLimiter, gcra::Quota, real_ip::RealIpPrivacyMask, RateLimitLayer};
-use http::Method;
 
 #[tokio::main]
 async fn main() {
@@ -31,11 +30,7 @@ async fn main() {
             // `Extract` is a helper type that allows using stateless key extractors
             RateLimitLayer::<Key, (), Hash>::builder(())
             .with_default_quota(Quota::simple(Duration::from_secs(5)))
-            // these could be simplified using a macro to insert the quota values using `add_quota` alongside the routes above
-            .with_route((Method::GET, "/build"), Quota::simple(Duration::from_secs(2)))
-            .with_route((Method::POST, "/reset"), Quota::simple(Duration::from_millis(1)))
             .with_extension(true) // required for the `Extension` extractor to work
-            .with_global_fallback(true)
             .with_gc_interval(Duration::from_secs(5))
             .default_handle_error(),
         );
