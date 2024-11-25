@@ -48,7 +48,8 @@ pub trait Key<S>: Hash + Eq + Send + Sync + 'static {
     }
 }
 
-impl<K, S> Key<S> for K where K: Hash + Eq + Send + Sync + 'static {}
+// TODO need more impls
+impl<S> Key<S> for () {}
 
 pub trait State: Clone + Send + Sync + 'static {}
 
