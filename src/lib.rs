@@ -41,14 +41,14 @@ use real_ip::RealIp; // needed for the doc link in the README
 ///
 /// Keys must also implement [`FromRequestParts`] to extract the key from the request
 /// within the rate limiter layer/service.
-pub trait Key: Hash + Eq + Send + Sync + 'static {
+pub trait Key<S>: Hash + Eq + Send + Sync + 'static {
     /// The quota for the key, defaulting to the global default quota if not set.
-    fn quota(&self) -> Option<gcra::Quota> {
+    fn quota(&self, _state: &S) -> Option<gcra::Quota> {
         None
     }
 }
 
-impl<K> Key for K where K: Hash + Eq + Send + Sync + 'static {}
+impl<K, S> Key<S> for K where K: Hash + Eq + Send + Sync + 'static {}
 
 pub trait State: Clone + Send + Sync + 'static {}
 
@@ -134,7 +134,7 @@ where
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
 ///
 /// Note: The limiter is shared across all clones of the layer and service.
-pub struct RateLimitService<I, K: Key = (), S: State = (), H: BuildHasher = RandomState> {
+pub struct RateLimitService<I, K: Key<S> = (), S: State = (), H: BuildHasher = RandomState> {
     inner: I,
     layer: RateLimitLayer<K, S, H>,
 }
@@ -170,7 +170,7 @@ impl<K, S, H: BuildHasher> Drop for RateLimitLayerBuilder<K, S, H> {
 /// This struct is not meant to be used directly, but rather through the [`RateLimitLayerBuilder`].
 ///
 /// Note: The limiter is shared across all clones of the layer and service.
-pub struct RateLimitLayer<K: Key = (), S = (), H: BuildHasher = RandomState> {
+pub struct RateLimitLayer<K: Key<S> = (), S = (), H: BuildHasher = RandomState> {
     builder: Arc<RateLimitLayerBuilder<K, S, H>>,
     limiter: Arc<gcra::RateLimiter<K, H>>,
 }
@@ -179,13 +179,13 @@ pub struct RateLimitLayer<K: Key = (), S = (), H: BuildHasher = RandomState> {
 ///
 /// Used to insert the rate limiter into the request's extensions,
 /// without knowing the type of the key except when the handler is defined and not further.
-trait SetExtension<K: Key, S, H: BuildHasher>: Send + Sync + 'static {
+trait SetExtension<K: Key<S>, S, H: BuildHasher>: Send + Sync + 'static {
     fn set_extension(&self, req: &mut Extensions, key: &K, layer: RateLimitLayer<K, S, H>);
 }
 
 struct DoSetExtension;
 
-impl<K: Key, S, H: BuildHasher> SetExtension<K, S, H> for DoSetExtension
+impl<K: Key<S>, S, H: BuildHasher> SetExtension<K, S, H> for DoSetExtension
 where
     K: Clone,
     S: State,
@@ -199,7 +199,7 @@ where
     }
 }
 
-impl<K: Key, S: State, H: BuildHasher> Clone for RateLimitLayer<K, S, H> {
+impl<K: Key<S>, S: State, H: BuildHasher> Clone for RateLimitLayer<K, S, H> {
     fn clone(&self) -> Self {
         Self {
             limiter: self.limiter.clone(),
@@ -208,7 +208,7 @@ impl<K: Key, S: State, H: BuildHasher> Clone for RateLimitLayer<K, S, H> {
     }
 }
 
-impl<I: Clone, K: Key, S: State, H: BuildHasher> Clone for RateLimitService<I, K, S, H> {
+impl<I: Clone, K: Key<S>, S: State, H: BuildHasher> Clone for RateLimitService<I, K, S, H> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -217,7 +217,7 @@ impl<I: Clone, K: Key, S: State, H: BuildHasher> Clone for RateLimitService<I, K
     }
 }
 
-impl<K: Key, S: State, H: BuildHasher> RateLimitLayer<K, S, H> {
+impl<K: Key<S>, S: State, H: BuildHasher> RateLimitLayer<K, S, H> {
     /// Begin building a new rate limiter layer starting with the default configuration.
     #[must_use]
     pub fn builder(state: S) -> RateLimitLayerBuilder<K, S, H> {
@@ -225,7 +225,7 @@ impl<K: Key, S: State, H: BuildHasher> RateLimitLayer<K, S, H> {
     }
 }
 
-impl<K: Key, S: State, H: BuildHasher> RateLimitLayerBuilder<K, S, H> {
+impl<K: Key<S>, S: State, H: BuildHasher> RateLimitLayerBuilder<K, S, H> {
     #[must_use]
     pub fn new(state: S) -> Self {
         RateLimitLayerBuilder {
@@ -295,7 +295,7 @@ impl<K: Key, S: State, H: BuildHasher> RateLimitLayerBuilder<K, S, H> {
     }
 }
 
-impl<K: Key + Default, S: State + Default> Default for RateLimitLayerBuilder<K, S> {
+impl<K: Key<S> + Default, S: State + Default> Default for RateLimitLayerBuilder<K, S> {
     fn default() -> Self {
         RateLimitLayerBuilder::new(Default::default())
     }
@@ -378,19 +378,19 @@ where
     }
 }
 
-impl<K: Key, S: State, H: BuildHasher> RateLimitLayer<K, S, H> {
+impl<K: Key<S>, S: State, H: BuildHasher> RateLimitLayer<K, S, H> {
     async fn req_peek_key<F>(&self, key: K, now: std::time::Instant, peek: F) -> Result<(), RateLimitError>
     where
         F: FnOnce(&K),
     {
-        let quota = key.quota().unwrap_or(self.builder.default_quota);
+        let quota = key.quota(&self.builder.state).unwrap_or(self.builder.default_quota);
         self.limiter.req_peek_key(key, quota, now, peek).await
     }
 }
 
 async fn get_user_key<K, S>(parts: &mut Parts, state: &S) -> Result<K, K::Rejection>
 where
-    K: Key + FromRequestParts<S>,
+    K: Key<S> + FromRequestParts<S>,
 {
     use core::mem::{size_of, transmute_copy};
 
@@ -439,7 +439,7 @@ where
 impl<I, K, S, B, H> Service<Request<B>> for RateLimitService<I, K, S, H>
 where
     I: Service<Request<B>, Future: TryFuture<Ok = I::Response, Error = I::Error>> + Clone + Send + 'static,
-    K: Key + FromRequestParts<S>,
+    K: Key<S> + FromRequestParts<S>,
     S: State,
     H: BuildHasher + Send + Sync + 'static,
 {
@@ -488,7 +488,7 @@ where
 
 impl<K, S, I, H> Layer<I> for RateLimitLayer<K, S, H>
 where
-    K: Key,
+    K: Key<S>,
     S: State,
     H: BuildHasher,
 {
@@ -506,7 +506,7 @@ use tower::layer::util::Stack;
 
 impl<K, S: State, H: BuildHasher> RateLimitLayerBuilder<K, S, H>
 where
-    K: Key + FromRequestParts<S>,
+    K: Key<S> + FromRequestParts<S>,
     H: Default + Send + Sync + 'static,
 {
     /// Build the [`RateLimitLayer`].
@@ -607,12 +607,12 @@ pub mod extensions {
     ///
     /// Note that the `K: Key` and `H: BuildHasher` types must be the
     /// exact same as those given to the [`RateLimitLayerBuilder`]/[`RateLimitLayer`].
-    pub struct RateLimiter<K: Key = (), S = (), H: BuildHasher = RandomState> {
+    pub struct RateLimiter<K: Key<S> = (), S = (), H: BuildHasher = RandomState> {
         pub(crate) key: K,
         pub(crate) layer: RateLimitLayer<K, S, H>,
     }
 
-    impl<K: Key + Clone, S: State, H: BuildHasher> Clone for RateLimiter<K, S, H> {
+    impl<K: Key<S> + Clone, S: State, H: BuildHasher> Clone for RateLimiter<K, S, H> {
         fn clone(&self) -> Self {
             Self {
                 key: self.key.clone(),
@@ -621,7 +621,7 @@ pub mod extensions {
         }
     }
 
-    impl<K: Key, S: State, H: BuildHasher> RateLimiter<K, S, H> {
+    impl<K: Key<S>, S: State, H: BuildHasher> RateLimiter<K, S, H> {
         /// Get the key used to identify the rate limiter entry.
         #[inline(always)]
         pub fn key(&self) -> &K {
