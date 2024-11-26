@@ -56,7 +56,7 @@ pub trait State: Clone + Send + Sync + 'static {}
 impl<S: Clone + Send + Sync + 'static> State for S {}
 
 pub mod gcra;
-pub use gcra::RateLimitError;
+pub use gcra::{Quota, RateLimitError};
 
 /// Interval for garbage collection of the rate limiter, which can be either
 /// a number of requests or a time duration.
